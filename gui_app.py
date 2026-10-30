@@ -2781,10 +2781,21 @@ def upload():
     out_dir.mkdir(parents=True, exist_ok=True)
     job_id = uuid.uuid4().hex
     pdf_path = out_dir / Path(uploaded.filename).name
-    uploaded.save(pdf_path)
+
+    # Той самий порядок денний вдруге просто замінює файл у папці. Але не під час його обробки.
+    if any(not j["done"] and j.get("pdf_path") == str(pdf_path) for j in list(jobs.values())):
+        return jsonify(error="Цей порядок денний зараз обробляється — дочекайтеся завершення й завантажте ще раз."), 400
+    replaced = pdf_path.exists()
+    try:
+        uploaded.save(pdf_path)
+    except OSError as exc:
+        return jsonify(error=f"Не вдалося записати файл порядку денного (можливо, він відкритий в іншій програмі — "
+                             f"закрийте його й спробуйте ще раз): {exc}"), 400
 
     set_current_agenda(agenda_title(uploaded.filename), out_dir)
-    jobs[job_id] = {"log": [], "done": False, "out_dir": str(out_dir), "audit": [], "pdf_path": str(pdf_path)}
+    log = (["Файл порядку денного вже був у папці — його замінено новою версією. Раніше скачані документи "
+            "не перезавантажуються (наявні файли пропускаються), звіти збираються заново."] if replaced else [])
+    jobs[job_id] = {"log": log, "done": False, "out_dir": str(out_dir), "audit": [], "pdf_path": str(pdf_path)}
     thread = threading.Thread(target=run_job, args=(job_id, pdf_path, out_dir), daemon=True)
     thread.start()
 
