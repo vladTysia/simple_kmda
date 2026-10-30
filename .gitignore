@@ -1,0 +1,7 @@
+__pycache__/
+.DS_Store
+.claude/
+uploaded_agendas/
+generation_uploads/
+downloaded_plenary_pdfs/
+Згенерованний ПР.docx
