@@ -11,6 +11,7 @@ https://kmr.gov.ua/uk/content/proekt-rishennya-kyyivskoyi-miskoyi-rady-<N>.
 """
 
 import argparse
+import os
 import re
 import shutil
 import sys
@@ -58,6 +59,8 @@ ITEM_Y_TOLERANCE = 6.0
 # Зсув посилання відносно номера пункту, більший за цей, вважаємо
 # підозрілим вирівнюванням (у нормі ~0.5pt) — про нього попереджає audit_agenda.
 MISALIGN_WARN_PT = 1.0
+# Де має починатися посилання відносно рядка з номером пункту (pt по вертикалі).
+LINK_ALIGNED_DY = -0.5
 
 
 def normalize_spaces(text: str) -> str:
@@ -306,8 +309,10 @@ def extract_agenda_items(pdf_path: Path):
 def audit_agenda(pdf_path: Path):
     """Шукає в PDF порядку денного помилки, які легко припустити вручну
     (пунктів сотні) і які ламають розбір. Повертає список зауважень
-    (вид, розділ, номер пункту або None, повідомлення), впорядкований за
-    розташуванням у документі. Нічого не завантажує.
+    (вид, розділ, номер пункту або None, повідомлення, extra), впорядкований за
+    розташуванням у документі. extra — дані для виправлення (або None): у
+    "немає посилання" {"pos": [сторінка, y]} пункту, в "однакове посилання"
+    {"items": [{"num", "section", "pos"}, ...]} — див. set_item_link. Нічого не завантажує.
 
     Види зауважень:
       "немає посилання"      — у пункті "N) Про ..." немає гіперпосилання;
@@ -373,8 +378,8 @@ def audit_agenda(pdf_path: Path):
 
     problems = []  # (порядок, вид, розділ, пункт, текст)
 
-    def add(order_item, kind, section_label, num, text):
-        problems.append(((order_item["page"], order_item["y"]) if order_item else (0, 0), kind, section_label, num, text))
+    def add(order_item, kind, section_label, num, text, extra=None):
+        problems.append(((order_item["page"], order_item["y"]) if order_item else (0, 0), kind, section_label, num, text, extra))
 
     def item_label(it):
         return f"«{it['snippet']}»" if it["snippet"] else ""
@@ -388,7 +393,8 @@ def audit_agenda(pdf_path: Path):
 
         if not uris:
             add(it, "немає посилання", it["section"], it["num"],
-                f"у пункті немає гіперпосилання на проєкт рішення — його не буде скачано. {item_label(it)}")
+                f"у пункті немає гіперпосилання на проєкт рішення — його не буде скачано. {item_label(it)}",
+                {"pos": [it["page"], it["y"]]})
         elif len(uris) > 1:
             add(it, "кілька посилань", it["section"], it["num"],
                 f"у пункті {len(uris)} різні посилання — усі проєкти скачаються з одним номером пункту. "
@@ -426,14 +432,155 @@ def audit_agenda(pdf_path: Path):
         note = ("підряд — програма об'єднає їх в один запис і скачає проєкт один раз"
                 if consecutive else "проєкт буде скачано окремо для кожного з них")
         add(owners[0], "однакове посилання", owners[0]["section"], owners[0]["num"],
-            f"те саме посилання у пунктах {nums} (розділ {', '.join(sections)}): {note}. {uri}")
+            f"те саме посилання у пунктах {nums} (розділ {', '.join(sections)}): {note}. {uri}",
+            {"items": [{"num": o["num"], "section": o["section"], "pos": [o["page"], o["y"]]} for o in owners]})
 
     for section_label, page_index, uri in orphans:
         problems.append(((page_index, 0), "посилання без пункту", section_label, None,
-                         f"посилання на стор. {page_index + 1} не належить жодному пункту «N) Про ...»: {uri}"))
+                         f"посилання на стор. {page_index + 1} не належить жодному пункту «N) Про ...»: {uri}", None))
 
     problems.sort(key=lambda p: p[0])
-    return [(kind, sec, num, text) for _, kind, sec, num, text in problems]
+    return [(kind, sec, num, text, extra) for _, kind, sec, num, text, extra in problems]
+
+
+def _document_layout(doc):
+    """Пункти порядку денного у порядку документа: [{section, num, page, y,
+    end}], де end = (сторінка, y) наступного маркера/заголовка — межа пункту.
+    Розділ і межі рахуються так само, як у audit_agenda."""
+    events = [(p, y, 0, ("heading", label)) for p, y, label in extract_section_headings(doc)]
+    events += [(p, y, 1, ("marker", num)) for p, y, num in extract_item_number_markers(doc)]
+    events.sort(key=lambda e: (e[0], e[1], e[2]))
+    items, section = [], "?"
+    for i, (p, y, _, (kind, payload)) in enumerate(events):
+        if kind == "heading":
+            section = payload
+            continue
+        nxt = events[i + 1] if i + 1 < len(events) else None
+        items.append({"section": section, "num": payload, "page": p, "y": y,
+                      "end": (nxt[0], nxt[1]) if nxt else (len(doc), 0.0)})
+    return items
+
+
+def _item_links(doc, item, cache=None):
+    """Усі анотації-посилання пункту (будь-якого виду, зокрема "биті" без адреси):
+    [(page_index, link_dict)]. Належність — за тим самим правилом, що й в audit."""
+    start, end = (item["page"], item["y"]), item["end"]
+    found = []
+    for pno in range(item["page"], min(end[0], len(doc) - 1) + 1):
+        if cache is not None and pno in cache:
+            links = cache[pno]
+        else:
+            links = doc[pno].get_links()
+            if cache is not None:
+                cache[pno] = links
+        for link in links:
+            rect = fitz.Rect(link["from"])
+            if not rect.is_empty and start <= (pno, rect.y0 + ITEM_Y_TOLERANCE) < end:
+                found.append((pno, link))
+    return found
+
+
+def _save_in_place(doc, path: Path):
+    """Зберігає зміни в той самий файл: інкрементально (швидко, не чіпає решту
+    файлу), а якщо PDF так зберегти не можна — повним перезаписом."""
+    try:
+        doc.saveIncr()
+    except (ValueError, RuntimeError):
+        tmp = path.with_name(path.stem + ".tmp.pdf")
+        doc.save(tmp)
+        doc.close()
+        os.replace(tmp, path)
+
+
+def fix_link_misalignment(pdf_path: Path, log=print) -> int:
+    """Вирівнює "зсунуті" посилання: якщо початок посилання пункту відхиляється від
+    рядка з номером пункту більше ніж на MISALIGN_WARN_PT, усі прямокутники посилань
+    пункту зсуваються так, щоб початок був на LINK_ALIGNED_DY. Правка — прямо у файлі;
+    кожну виправлену помилку записує в журнал рядком "[~]". Повертає кількість пунктів."""
+    doc = fitz.open(pdf_path)
+    try:
+        cache, fixed = {}, 0
+        for item in _document_layout(doc):
+            links = [(p, l) for p, l in _item_links(doc, item, cache)
+                     if l.get("kind") == fitz.LINK_URI and PROJECT_URL_RE.search(l.get("uri", ""))]
+            if not links:
+                continue
+            first_page, first = min(links, key=lambda t: (t[0], fitz.Rect(t[1]["from"]).y0))
+            if first_page != item["page"]:
+                continue  # інша сторінка — це не зсув по вертикалі, лишаємо для ручної перевірки
+            dy = fitz.Rect(first["from"]).y0 - item["y"]
+            if abs(dy) <= MISALIGN_WARN_PT:
+                continue
+            shift = LINK_ALIGNED_DY - dy
+            for pno, link in links:
+                r = fitz.Rect(link["from"])
+                doc[pno].update_link({**link, "from": fitz.Rect(r.x0, r.y0 + shift, r.x1, r.y1 + shift)})
+            fixed += 1
+            log(f"[~] Виправлено автоматично: розділ {item['section']}, пункт {item['num']} — "
+                f"посилання було зсунуте на {dy:+.1f} pt (стор. {item['page'] + 1}), вирівняно за номером пункту.")
+        if fixed:
+            _save_in_place(doc, pdf_path)
+        return fixed
+    finally:
+        doc.close()
+
+
+def _add_links_over_item(doc, item, uri: str) -> int:
+    """Запасний шлях, коли в пункті взагалі немає прямокутників посилання: додає
+    по одному на кожен візуальний рядок тексту пункту (як це робить Word)."""
+    start, end = (item["page"], item["y"]), item["end"]
+    added = 0
+    for pno in range(item["page"], min(end[0], len(doc) - 1) + 1):
+        rows = []  # [x0, y0, x1, y1]
+        for block in doc[pno].get_text("dict")["blocks"]:
+            if block.get("type") != 0:
+                continue
+            for line in block["lines"]:
+                text = "".join(sp["text"] for sp in line["spans"]).strip()
+                x0, y0, x1, y1 = line["bbox"]
+                if not text or text.isdigit() or not (start <= (pno, y0) < end):
+                    continue
+                if pno == item["page"] and abs(y0 - item["y"]) < 0.01:
+                    # рядок із маркером: посилання починається від "Про", а не від "N)"
+                    first = next((sp for sp in line["spans"] if sp["text"].strip().startswith("Про")), None)
+                    if first:
+                        x0 = first["bbox"][0] - 2.2
+                rows.append([x0, y0, x1, y1])
+        rows.sort(key=lambda r: (round(r[1]), r[0]))
+        merged = []
+        for r in rows:
+            if merged and abs(r[1] - merged[-1][1]) < 2:
+                merged[-1][0], merged[-1][2] = min(merged[-1][0], r[0]), max(merged[-1][2], r[2])
+            else:
+                merged.append(r)
+        for x0, y0, x1, y1 in merged:
+            doc[pno].insert_link({"kind": fitz.LINK_URI, "uri": uri,
+                                  "from": fitz.Rect(x0, y0 + LINK_ALIGNED_DY, x1, y1 + 1.2)})
+            added += 1
+    return added
+
+
+def set_item_link(pdf_path: Path, pos, uri: str) -> int:
+    """Прописує посилання uri всім прямокутникам пункту, що починається на pos =
+    [сторінка, y] (так його позначає audit_agenda): замінює "биті" посилання без
+    адреси і дублікати. Правка — прямо у файлі. Повертає кількість прямокутників."""
+    doc = fitz.open(pdf_path)
+    try:
+        item = next((it for it in _document_layout(doc)
+                     if it["page"] == pos[0] and abs(it["y"] - pos[1]) < 0.01), None)
+        if item is None:
+            raise ValueError("Пункт не знайдено у файлі — можливо, файл змінився. Завантажте порядок денний ще раз.")
+        links = _item_links(doc, item)
+        for pno, link in links:
+            doc[pno].update_link({"kind": fitz.LINK_URI, "uri": uri, "from": fitz.Rect(link["from"]),
+                                  "xref": link["xref"]})
+        count = len(links) or _add_links_over_item(doc, item, uri)
+        if not count:
+            raise ValueError("У пункті не знайдено тексту, на який можна поставити посилання.")
+        _save_in_place(doc, pdf_path)
+        return count
+    finally:
+        doc.close()
 
 
 def log_audit(problems, log=print):
@@ -442,7 +589,7 @@ def log_audit(problems, log=print):
         log("Перевірка порядку денного: помилок не знайдено.")
         return 0
     log(f"Перевірка порядку денного: знайдено {len(problems)} зауважень (варто перевірити вручну в PDF):")
-    for kind, sec, num, text in problems:
+    for kind, sec, num, text, _ in problems:
         where = f"розділ {sec}" + (f", пункт {num}" if num is not None else "")
         log(f"  - [{kind}] {where}: {text}")
     return len(problems)
@@ -510,10 +657,29 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r"\s+", " ", name)
 
 
-REPORT_NAME = "Отчет_раздела.pdf"
+REPORT_NAME = "Звіт_розділу.pdf"
 MAIN_FILENAME_RE = re.compile(r"^\d+_\d{2}\.\d{2}\.\d{4}_")
 MAIN_FILENAME_NUMBER_TAG_RE = re.compile(r"^(\d+)_\d{2}\.\d{2}\.\d{4}_(.+)\.pdf$")
-FOR_DEPUTIES_DIR_NAME = "Для депутатов"
+FOR_DEPUTIES_DIR_NAME = "Для депутатів"
+# Колишня (російська) назва: у вже скачаних наборах така папка лишилась від старих запусків.
+LEGACY_FOR_DEPUTIES_DIR_NAMES = ("Для депутатов",)
+# Згенеровані файли зі старими (російськими) назвами від попередніх запусків.
+LEGACY_ARTIFACT_PATTERNS = ("Отчет_раздела.pdf", "Отчет_раздела_и_микс_*.pdf", "Микс_*.pdf", "Друк_раздела_*.pdf")
+
+
+def remove_legacy_artifacts(out_dir: Path, log=print) -> int:
+    """Прибирає звіти й мікси зі старими назвами: програма щоразу генерує їх
+    заново вже з українськими назвами, а старі лишилися б поруч (і могли б потрапити
+    в нові звіти)."""
+    removed = 0
+    for pattern in LEGACY_ARTIFACT_PATTERNS:
+        for path in out_dir.rglob(pattern):
+            if path.is_file():
+                path.unlink()
+                removed += 1
+    if removed:
+        log(f"[=] Прибрано {removed} згенерованих файлів зі старими назвами — замінено файлами з українськими назвами.")
+    return removed
 
 
 def build_section_reports(out_dir: Path, log=print):
@@ -524,9 +690,13 @@ def build_section_reports(out_dir: Path, log=print):
         return
 
     for section_dir in sorted(p for p in out_dir.iterdir() if p.is_dir()):
+        # Копії пунктів у "Для депутатів" названі так само, як основні файли, — без
+        # цього виключення при повторному запуску вони дублювалися б у звіті.
         pdf_files = [
             p for p in section_dir.rglob("*.pdf")
             if p.name != REPORT_NAME and MAIN_FILENAME_RE.match(p.name)
+            and FOR_DEPUTIES_DIR_NAME not in p.relative_to(section_dir).parts
+            and not any(name in p.relative_to(section_dir).parts for name in LEGACY_FOR_DEPUTIES_DIR_NAMES)
         ]
         if not pdf_files:
             continue
@@ -551,8 +721,8 @@ def build_section_reports(out_dir: Path, log=print):
 
 def _mix_sort_index(mix_path: Path) -> int:
     """Визначає порядковий індекс мікс-файлу — він тепер зашитий прямо в
-    назву ("Микс_<папка>_<index_prefix>_<номер>.pdf")."""
-    prefix = f"Микс_{mix_path.parent.name}_"
+    назву ("Мікс_<папка>_<index_prefix>_<номер>.pdf")."""
+    prefix = f"Мікс_{mix_path.parent.name}_"
     if not mix_path.stem.startswith(prefix):
         return 10**9
     match = re.match(r"^(\d+)_", mix_path.stem[len(prefix):])
@@ -561,13 +731,13 @@ def _mix_sort_index(mix_path: Path) -> int:
 
 def build_section_mix_reports(out_dir: Path, log=print):
     """У кожній папці розділу (out_dir/<major>) створює
-    "Отчет_раздела_и_микс_<номер папки>.pdf" — об'єднання всіх файлів "Микс_*"
+    "Звіт_розділу_і_мікс_<номер папки>.pdf" — об'єднання всіх файлів "Мікс_*"
     з цього розділу та його підрозділів, у порядку пунктів повістки."""
     if not out_dir.exists():
         return
 
     for section_dir in sorted(p for p in out_dir.iterdir() if p.is_dir()):
-        mix_files = list(section_dir.rglob("Микс_*.pdf"))
+        mix_files = list(section_dir.rglob("Мікс_*.pdf"))
         if not mix_files:
             continue
 
@@ -578,7 +748,7 @@ def build_section_mix_reports(out_dir: Path, log=print):
             with fitz.open(mix_file) as src:
                 merged.insert_pdf(src)
 
-        report_path = section_dir / f"Отчет_раздела_и_микс_{section_dir.name}.pdf"
+        report_path = section_dir / f"Звіт_розділу_і_мікс_{section_dir.name}.pdf"
         merged.save(report_path)
         merged.close()
         log(f"[=] Зібрано звіт+мікс розділу {section_dir.name}: {report_path.relative_to(out_dir)} "
@@ -587,11 +757,17 @@ def build_section_mix_reports(out_dir: Path, log=print):
 
 def build_for_deputies(out_dir: Path, log=print):
     """У кожній "листовій" папці розділу (де реально лежать скачані файли,
-    напр. out_dir/1/1.1/1.1.1 чи out_dir/3) створює підпапку "Для депутатов" з
-    рівно одним файлом на кожен пункт: Микс-файлом, якщо для цього пункту
+    напр. out_dir/1/1.1/1.1.1 чи out_dir/3) створює підпапку "Для депутатів" з
+    рівно одним файлом на кожен пункт: Мікс-файлом, якщо для цього пункту
     є додаткові файли, інакше основним файлом пункту."""
     if not out_dir.exists():
         return
+
+    # Стара папка з російською назвою — це згенерована копія (її й так щоразу
+    # пересоздавали); якщо лишити, її сприйняло б за "розділ" і вклало б у неї нову.
+    for legacy in sorted(p for p in out_dir.rglob("*") if p.is_dir() and p.name in LEGACY_FOR_DEPUTIES_DIR_NAMES):
+        shutil.rmtree(legacy)
+        log(f"[=] Прибрано стару папку «{legacy.name}»: {legacy.relative_to(out_dir)} (замінено на «{FOR_DEPUTIES_DIR_NAME}»)")
 
     for section_dir in sorted(p for p in out_dir.rglob("*") if p.is_dir() and p.name != FOR_DEPUTIES_DIR_NAME):
         # Ключ — index_prefix (номер пункту), а не number_tag: номер рішення
@@ -615,12 +791,12 @@ def build_for_deputies(out_dir: Path, log=print):
         deputies_dir.mkdir()
 
         for index_prefix, (number_tag, main_path) in main_by_index.items():
-            mix_path = section_dir / f"Микс_{section_dir.name}_{index_prefix}_{number_tag}.pdf"
+            mix_path = section_dir / f"Мікс_{section_dir.name}_{index_prefix}_{number_tag}.pdf"
             source = mix_path if mix_path.exists() else main_path
 
-            # Номер пункту в назву — щоб Микс-файл сортувався у "Для
-            # депутатов" на своєму місці за порядком денним, а не за назвою
-            # ("Микс_..." впав би в кінець).
+            # Номер пункту в назву — щоб Мікс-файл сортувався у "Для
+            # депутатів" на своєму місці за порядком денним, а не за назвою
+            # ("Мікс_..." впав би в кінець).
             base_name = re.sub(r"^\d+_", "", source.name)
             dest_name = f"{index_prefix}_{base_name}"
             shutil.copy2(source, deputies_dir / dest_name)
@@ -640,14 +816,14 @@ def build_for_deputies(out_dir: Path, log=print):
 
 def build_section_druk(out_dir: Path, log=print):
     """У кожній папці розділу верхнього рівня (out_dir/<major>) створює
-    "Друк_раздела_<major>.pdf" — об'єднання файлів "Друк.pdf" з "Для
-    депутатов" цього розділу й усіх його підрозділів, у порядку підрозділів
+    "Друк_розділу_<major>.pdf" — об'єднання файлів "Друк.pdf" з "Для
+    депутатів" цього розділу й усіх його підрозділів, у порядку підрозділів
     (1.1, потім 1.2, ...)."""
     if not out_dir.exists():
         return
 
     def section_sort_key(druk_path: Path):
-        # druk_path = .../<major>/[<підрозділи>/]Для депутатов/Друк.pdf
+        # druk_path = .../<major>/[<підрозділи>/]Для депутатів/Друк.pdf
         section_name = druk_path.parent.parent.name
         try:
             return tuple(int(x) for x in section_name.split("."))
@@ -666,7 +842,7 @@ def build_section_druk(out_dir: Path, log=print):
             with fitz.open(druk_file) as src:
                 merged.insert_pdf(src)
 
-        report_path = major_dir / f"Друк_раздела_{major_dir.name}.pdf"
+        report_path = major_dir / f"Друк_розділу_{major_dir.name}.pdf"
         merged.save(report_path)
         merged.close()
         log(f"[=] Друк розділу {major_dir.name}: {report_path.relative_to(out_dir)} "
@@ -675,11 +851,11 @@ def build_section_druk(out_dir: Path, log=print):
 
 def build_item_mix(out_dir: Path, section_dir: Path, main_path: Path, extra_paths: list, index_prefix: str, number_tag: str, log=print):
     """Об'єднує основний файл засідання (завжди першим) з усіма додатковими
-    файлами того ж пункту в один pdf "Микс_<папка>_<index_prefix>_<номер>.pdf".
+    файлами того ж пункту в один pdf "Мікс_<папка>_<index_prefix>_<номер>.pdf".
     index_prefix (номер пункту) потрібен для унікальності: номер рішення
     (number_tag) сам по собі може повторюватись у різні роки.
     Якщо додаткових файлів немає, мікс не створюється (а старий, зайвий, видаляється)."""
-    mix_path = section_dir / f"Микс_{section_dir.name}_{index_prefix}_{number_tag}.pdf"
+    mix_path = section_dir / f"Мікс_{section_dir.name}_{index_prefix}_{number_tag}.pdf"
 
     if not main_path.exists() or not extra_paths:
         if mix_path.exists():
@@ -697,18 +873,29 @@ def build_item_mix(out_dir: Path, section_dir: Path, main_path: Path, extra_path
     log(f"    [=] Мікс: {mix_path.relative_to(out_dir)}")
 
 
-def download_agenda_pdfs(pdf_path: Path, out_dir: Path, delay: float, log=print, on_audit=None):
+def download_agenda_pdfs(pdf_path: Path, out_dir: Path, delay: float, log=print, on_audit=None, autofix=False):
     """on_audit — необов'язковий колбек: якщо заданий, зауваження перевірки PDF
-    передаються йому списком (kind, section, item, text) і не засмічують журнал
-    (туди йде лише короткий рядок); інакше їх повністю виводить log."""
+    передаються йому списком (kind, section, item, text, extra) і не засмічують
+    журнал (туди йде лише короткий рядок); інакше їх повністю виводить log.
+    Якщо колбек повертає False — завантаження не починається (чекаємо, поки
+    користувач виправить зауваження), функція одразу завершується.
+    autofix — правити PDF прямо у файлі (зараз: вирівнювання зсунутих посилань)
+    ще до перевірки; у GUI це копія порядку денного в папці результатів."""
+    if autofix:
+        fix_link_misalignment(pdf_path, log)
     audit_problems = audit_agenda(pdf_path)
     if on_audit is None:
         log_audit(audit_problems, log)
     else:
-        on_audit(audit_problems)
+        hold = on_audit(audit_problems) is False
+        if hold:
+            log(f"Перевірка порядку денного: знайдено {len(audit_problems)} зауважень — див. блок «Зауваження до PDF».")
+            log("Завантаження не розпочато: спершу виправте зауваження або позначте їх галочкою — "
+                "після цього файл буде перевірено ще раз і завантаження почнеться.")
+            return 0, 0, []
         log("Перевірка порядку денного: " + (
-            f"знайдено {len(audit_problems)} зауважень — див. блок «Зауваження до PDF»."
-            if audit_problems else "помилок не знайдено."))
+            "помилок не знайдено." if not audit_problems
+            else f"зауваження ({len(audit_problems)}) опрацьовані — продовжуємо."))
     items, unresolved = extract_agenda_items(pdf_path)
     total_found = len(items) + len(unresolved)
     log(f"Знайдено посилань на проєкти рішень: {total_found}")
@@ -729,6 +916,7 @@ def download_agenda_pdfs(pdf_path: Path, out_dir: Path, delay: float, log=print,
             log(f"  - {item_label} (розділ {section}): {uri}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    remove_legacy_artifacts(out_dir, log)
     session = requests.Session()
     session.headers.update(HEADERS)
 
@@ -829,7 +1017,7 @@ def download_agenda_pdfs(pdf_path: Path, out_dir: Path, delay: float, log=print,
     if audit_problems and on_audit is None:
         log(f"\nУвага: перевірка порядку денного знайшла {len(audit_problems)} зауважень у самому PDF "
             f"(див. початок журналу) — перегляньте їх.")
-        for kind, sec, num, text in audit_problems:
+        for kind, sec, num, text, _ in audit_problems:
             if kind in ("немає посилання", "порушена нумерація", "посилання без пункту"):
                 log(f"  - [{kind}] розділ {sec}" + (f", пункт {num}" if num is not None else ""))
 

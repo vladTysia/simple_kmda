@@ -1,0 +1,52 @@
+name: Build Windows installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Prepare bundled Tesseract (with Ukrainian data)
+        shell: pwsh
+        run: |
+          choco install tesseract --no-progress -y
+          $src = "C:\Program Files\Tesseract-OCR"
+          Copy-Item $src build_tesseract -Recurse
+          Get-ChildItem build_tesseract\tessdata -Filter *.traineddata | Remove-Item
+          foreach ($f in "ukr", "eng", "osd") {
+            Invoke-WebRequest "https://github.com/tesseract-ocr/tessdata_fast/raw/main/$f.traineddata" `
+              -OutFile "build_tesseract\tessdata\$f.traineddata"
+          }
+          build_tesseract\tesseract.exe --list-langs
+
+      - name: Build app with PyInstaller
+        run: >
+          pyinstaller --noconfirm --windowed --name PlenaryAgenda
+          --hidden-import pythoncom --hidden-import win32com.client
+          --collect-submodules send2trash
+          --add-data "build_tesseract;tesseract"
+          gui_app.py
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PlenaryAgenda-Setup
+          path: installer/PlenaryAgenda-Setup.exe
