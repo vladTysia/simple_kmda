@@ -5,3 +5,13 @@ uploaded_agendas/
 generation_uploads/
 downloaded_plenary_pdfs/
 Згенерованний ПР.docx
+build/
+dist/
+installer/
+build_tesseract/
+*.spec
+last_agenda.json
+section_titles.json
+contacts.json
+mail_settings.json
+contact_groups.json
