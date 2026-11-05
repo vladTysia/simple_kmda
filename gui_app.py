@@ -11,6 +11,8 @@
 """
 
 import html
+import collections
+import copy
 import csv
 import io
 import json
@@ -40,6 +42,7 @@ from docx.oxml.ns import qn
 from docx.shared import Inches, Pt
 from flask import Flask, jsonify, render_template_string, request
 
+import agenda_doc
 import download_pleanary_pdf as core
 from icons import sprite as icon_sprite
 
@@ -50,6 +53,7 @@ BASE_DIR = (Path.home() / "Documents" / "Порядок денний") if FROZEN
 BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_OUT_DIR = BASE_DIR / "downloaded_plenary_pdfs"
+SETTINGS_PATH = BASE_DIR / "settings.json"
 GENERATE_UPLOADS_DIR = BASE_DIR / "generation_uploads"
 GENERATED_DOC_PATH = BASE_DIR / "Згенерованний ПР.docx"
 
@@ -64,28 +68,206 @@ DEFAULT_SECTION_TITLES = {
     6: "Різне",
 }
 SECTION_TITLES_PATH = BASE_DIR / "section_titles.json"
+# Розділи — дерево до 4 рівнів з ідентифікаторами "1", "1.1", "1.1.1", "1.1.1.1". Верхні (1–6) є завжди,
+# підрозділи додає користувач; їхні номери йдуть підряд (1.1, 1.2, …) і перераховуються при видаленні.
+MAX_SECTION_DEPTH = 4
+NEW_SUBSECTION_TITLE = "Новий підрозділ"
+SECTION_ID_RE = re.compile(r"^[1-9]\d*(\.[1-9]\d*){0,3}$")
+
+
+def section_key(section_id: str) -> list:
+    return [int(part) for part in section_id.split(".")]
+
+
+def section_depth(section_id: str) -> int:
+    return len(section_id.split("."))
 
 
 def load_section_titles() -> dict:
-    if SECTION_TITLES_PATH.exists():
-        try:
-            saved = json.loads(SECTION_TITLES_PATH.read_text(encoding="utf-8"))
-            return {n: saved.get(str(n), DEFAULT_SECTION_TITLES[n]) for n in range(1, 7)}
-        except (json.JSONDecodeError, OSError):
-            pass
-    return dict(DEFAULT_SECTION_TITLES)
+    """Назви розділів і підрозділів: {"1": ..., "1.1": ...}. Підрозділ без наявного батька відкидається."""
+    titles = {str(n): title for n, title in DEFAULT_SECTION_TITLES.items()}
+    try:
+        saved = json.loads(SECTION_TITLES_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return titles
+    if not isinstance(saved, dict):
+        return titles
+    for sid in sorted((k for k in saved if SECTION_ID_RE.match(str(k))), key=section_key):
+        title = saved[sid]
+        if not isinstance(title, str) or not title.strip():
+            continue
+        if section_depth(sid) == 1:
+            if sid in titles:
+                titles[sid] = title
+        elif sid.rsplit(".", 1)[0] in titles:
+            titles[sid] = title
+    return titles
 
 
 def save_section_titles(titles: dict):
     SECTION_TITLES_PATH.write_text(
-        json.dumps({str(n): titles[n] for n in range(1, 7)}, ensure_ascii=False, indent=2),
+        json.dumps({sid: titles[sid] for sid in sorted(titles, key=section_key)}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
 
+def section_ids(titles: dict = None) -> list:
+    """Усі розділи й підрозділи в порядку документа: 1, 1.1, 1.1.1, 1.2, 2, …"""
+    return sorted(SECTION_TITLES if titles is None else titles, key=section_key)
+
+
+def plan_section_delete(titles: dict, section_id: str):
+    """Що станеться при видаленні підрозділу: (нові назви, {старий id: новий id}, множина видалених).
+    Наступні сусіди (і їхні вкладені) отримують номери на один менший; видалені йдуть до батька."""
+    parts = section_id.split(".")
+    depth, parent = len(parts), ".".join(parts[:-1])
+    removed = {k for k in titles if k == section_id or k.startswith(section_id + ".")}
+    mapping = {k: parent for k in removed}
+    position = int(parts[-1])
+    for k in titles:
+        kp = k.split(".")
+        if k not in removed and len(kp) >= depth and kp[:depth - 1] == parts[:-1] and int(kp[depth - 1]) > position:
+            shifted = list(kp)
+            shifted[depth - 1] = str(int(kp[depth - 1]) - 1)
+            mapping[k] = ".".join(shifted)
+    new_titles = {mapping.get(k, k): v for k, v in titles.items() if k not in removed}
+    return new_titles, mapping, removed
+
+
 SECTION_TITLES = load_section_titles()
 
-DECISION_NUMBER_RE = re.compile(r"^(\d+)-")
+# Назва файлу проєкту: "183-25.pdf" — номер рішення 183, рік 2025 ("25" або "2025").
+MAX_SEARCH_PAGES = 5   # скільки сторінок видачі пошуку переглядати
+MAX_CANDIDATES = 40    # скільки знайдених проєктів перевіряти на рік
+
+
+def check_decision_filename(filename: str):
+    """Перевіряє назву файлу проєкту на формат НОМЕР-РІК.pdf.
+    Повертає (номер, рік, помилка): помилка — текст для користувача або None."""
+    m = re.match(r"^(\d+)(.*)$", filename)
+    if not m:
+        return None, None, "назва не починається з номера рішення"
+    number, rest = m.groups()
+    ym = re.match(r"-(\d+)", rest)
+    if not ym:
+        return number, None, f"після номера {number} немає дефіса та року"
+    digits = ym.group(1)
+    if len(digits) not in (2, 4):
+        return number, None, f"рік «{digits}» має складатися з 2 або 4 цифр"
+    year = 2000 + int(digits) if len(digits) == 2 else int(digits)
+    if not (2000 <= year <= datetime.now().year + 1):
+        return number, None, f"рік {year} виглядає неправильно"
+    return number, year, None
+
+
+def suggest_decision_filename(filename: str):
+    """Підказка для назви на кшталт "рішення 183 від 2025.pdf" -> "183-25.pdf" (або None)."""
+    m = re.match(r"^\D*?(\d{1,6})\D+(\d{4}|\d{2})\D*\.pdf$", filename, re.IGNORECASE)
+    if not m:
+        return None
+    guess = f"{m.group(1)}-{m.group(2)[-2:]}.pdf"
+    return guess if check_decision_filename(guess)[2] is None else None
+
+
+def generate_name_entries(paths) -> list:
+    """Зауваження до назв файлів (у такому ж вигляді, як зауваження до порядку денного)."""
+    entries = []
+    for path in sorted(paths, key=lambda p: p.name):
+        _, _, error = check_decision_filename(path.name)
+        if error:
+            entries.append({
+                "id": f"name|{path.name}", "kind": "некоректна назва файлу", "filename": path.name,
+                "text": f"{error}. Очікується формат НОМЕР-РІК.pdf, напр. 183-25.pdf. "
+                        "Перейменуйте файл або позначте галочкою, щоб пропустити його.",
+                "suggest": suggest_decision_filename(path.name),
+            })
+    return entries
+
+
+def validate_new_filename(raw: str, folder: Path, current: str) -> str:
+    """Нова назва від користувача -> коректна назва файлу (".pdf" дописується сам)."""
+    name = (raw or "").strip().strip('"')
+    if not name:
+        raise ValueError("Вкажіть нову назву файлу.")
+    if re.search(r'[\\/:*?"<>|]', name):
+        raise ValueError('Назва не може містити символи \\ / : * ? " < > |')
+    name = re.sub(r"\s+(\.pdf)$", r"\1", name, flags=re.IGNORECASE)
+    if "." not in name:
+        name += ".pdf"
+    elif not name.lower().endswith(".pdf"):
+        raise ValueError("Файл має бути у форматі .pdf.")
+    _, _, error = check_decision_filename(name)
+    if error:
+        raise ValueError(f"{error}. Приклад правильної назви: 183-25.pdf")
+    if name != current and (folder / name).exists():
+        raise ValueError("Файл з такою назвою вже є в цій папці.")
+    return name
+
+
+def _year_of(date_text):
+    match = re.search(r"(?<!\d)(\d{4})(?!\d)", date_text or "")
+    return int(match.group(1)) if match else None
+
+
+def _search_candidates(session, number):
+    """Посилання на проєкти з пошуку — по всіх сторінках видачі, у порядку видачі.
+    Зупиняється, коли сторінка порожня або нічого нового не дала."""
+    seen = set()
+    for page in range(MAX_SEARCH_PAGES):
+        url = SEARCH_URL_TEMPLATE.format(number=number) + (f"&page={page}" if page else "")
+        resp = session.get(url, timeout=20)
+        resp.raise_for_status()
+        fresh = [h for h in dict.fromkeys(m.group(1) for m in SEARCH_RESULT_LINK_RE.finditer(resp.text))
+                 if h not in seen]
+        if not fresh:
+            return
+        seen.update(fresh)
+        yield from fresh
+
+
+def _number_on_page(html: str, number: str) -> bool:
+    """Чи згадується на сторінці проєкту номер рішення ("08/231-183/ПР" або "183/ПР")."""
+    n = re.escape(number)
+    return bool(re.search(rf"(?<!\d){n}\s*/\s*ПР|{re.escape(DECISION_PREFIX)}\s*-\s*{n}(?!\d)", html, re.IGNORECASE))
+
+
+def find_project_page(session, number: str, year):
+    """Шукає на сайті проєкт рішення за номером і роком. Номер у різні роки повторюється
+    (183/ПР є і за 2025, і за 2026), тому серед результатів пошуку береться той, чия дата
+    реєстрації припадає на потрібний рік. Повертає (url, html сторінки, примітка або None);
+    якщо нічого підходящого немає — LookupError з поясненням."""
+    fallback, years_seen, checked = None, [], 0
+    for href in _search_candidates(session, number):
+        project_url = SEARCH_RESULT_BASE_URL + href
+        if year is None:  # рік у назві не вказано — як і раніше, перший результат
+            resp = session.get(project_url, timeout=20)
+            resp.raise_for_status()
+            return project_url, resp.text, "рік у назві файлу не вказано — взято перший результат пошуку"
+        if checked >= MAX_CANDIDATES:
+            break
+        checked += 1
+        try:
+            resp = session.get(project_url, timeout=20)
+            resp.raise_for_status()
+        except Exception:
+            continue
+        page_year = _year_of(extract_project_date(resp.text))
+        if page_year != year:
+            years_seen.append(page_year)
+            continue
+        if _number_on_page(resp.text, number):
+            return project_url, resp.text, None
+        if fallback is None:
+            fallback = (project_url, resp.text)
+    if fallback:
+        return fallback[0], fallback[1], (f"рік {year} збігається, але номер {number} на сторінці проєкту "
+                                          f"не підтверджено — перевірте посилання")
+    if not checked:
+        raise LookupError("у результатах пошуку не знайдено жодного посилання на проєкт рішення")
+    shown = ", ".join(sorted({str(y) if y else "?" for y in years_seen}))
+    raise LookupError(f"серед знайдених проєктів ({checked}) немає за {year} рік (роки знайдених: {shown})")
+
+
 SEARCH_URL_TEMPLATE = "https://old.kmr.gov.ua/uk/search-result?search_api_views_fulltext={number}&type=decision"
 # Текст посилання на сторінці пошуку не завжди містить номер у кінці і
 # буває або "Проєкт", або "Проект" (без "є") залежно від запису — тож
@@ -148,8 +330,24 @@ SPEAKER_BLOCK_PATTERNS = [
         r"([А-ЯІЇЄҐ][’'а-яіїєґ]+)\s+([А-ЯІЇЄҐ][’'а-яіїєґ]+)\s+([А-ЯІЇЄҐ][’'а-яіїєґ]+)\s*[,(]",
     ),
 ]
+# Формулювання, де імʼя йде ПЕРЕД прізвищем, а прізвище — великими літерами, без по батькові:
+# "Доповідач: директор Департаменту земельних ресурсів Валентина ПЕЛИХ." -> "Пелих В."
+# Після прізвища обовʼязкове завершення (крапка, кома, дужка, кінець рядка), щоб не сплутати
+# з назвою посади, де трапляється слово великими літерами ("Департамент ЗЕМЕЛЬНИХ ресурсів").
+SPEAKER_NAME_FIRST_PATTERNS = [
+    re.compile(
+        r"[Дд]оповідач\s*:[\s\S]{0,250}?"
+        r"([А-ЯІЇЄҐ][’'а-яіїєґ]+)\s+([А-ЯІЇЄҐ][А-ЯІЇЄҐ’'\-]{1,})(?=\s*(?:[.,(;]|$))",
+        re.MULTILINE,
+    ),
+]
 OCR_LANG = "ukr"
 OCR_DPI = 300
+
+
+def _surname_case(surname: str) -> str:
+    """"ПЕЛИХ" -> "Пелих", "КОВАЛЬ-ПЕТРЕНКО" -> "Коваль-Петренко"."""
+    return "-".join(part.capitalize() for part in surname.split("-"))
 
 def _tesseract_candidates():
     """tesseract не завжди потрапляє в PATH після встановлення, а на Windows
@@ -426,6 +624,22 @@ PAGE = """
     font-family: Menlo, Consolas, monospace; font-size: 12.5px;
   }
   #outdir:focus { outline: none; border-color: var(--primary); }
+  .field-row { display: flex; gap: 8px; align-items: stretch; }
+  .field-row .field-wrap { flex: 1; min-width: 0; }
+  .pick-btn { flex: none; padding: 0 14px; border-radius: 10px; border: 1px solid var(--border); background: transparent;
+    color: var(--text); font-size: 13px; font-weight: 600; cursor: pointer; }
+  .pick-btn:hover { background: var(--bg); }
+  .pending-list { display: none; margin-top: 8px; max-height: 190px; overflow: auto; border: 1px solid var(--border);
+    border-radius: 10px; }
+  .p-row { display: flex; align-items: center; gap: 8px; padding: 6px 10px; font-size: 12.5px; }
+  .p-row + .p-row { border-top: 1px solid var(--border); }
+  .p-row .p-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .p-row .p-size { color: var(--text-muted); font-size: 11.5px; flex: none; }
+  .p-row .p-del { border: 0; background: none; color: var(--text-muted); cursor: pointer; padding: 2px 5px;
+    border-radius: 6px; display: flex; }
+  .p-row .p-del:hover { color: var(--red); background: var(--red-soft); }
+  .p-row .p-del .ic { width: 13px; height: 13px; }
+  .field-hint { font-size: 12px; color: var(--text-muted); margin-top: 6px; line-height: 1.45; }
 
   button.primary {
     width: 100%; margin-top: 20px; padding: 12px 16px; border: none; border-radius: 10px;
@@ -514,6 +728,7 @@ PAGE = """
     color: var(--amber); margin-right: 6px;
   }
   .audit-item .a-where { font-weight: 600; margin-right: 6px; }
+  .audit-item .a-pr { font-weight: 600; color: var(--primary); margin-right: 6px; }
   .audit-item .a-text { color: var(--text-muted); word-break: break-word; }
   .audit-item.fixed { opacity: .55; }
   .audit-item.fixed .a-where, .audit-item.fixed .a-text { text-decoration: line-through; }
@@ -548,6 +763,55 @@ PAGE = """
     background: var(--primary-soft); color: var(--primary);
     font-size: 11px; font-weight: 700; flex-shrink: 0;
   }
+  .results-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .new-info { font-size: 13px; color: var(--text-muted); margin-bottom: 10px; line-height: 1.5; }
+  .new-info:empty { display: none; }
+  .result-item.is-new { border-color: var(--amber); background: var(--amber-soft); box-shadow: inset 4px 0 0 var(--amber); }
+  .new-badge { display: inline-block; font-size: 10.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+    color: var(--amber); border: 1px solid var(--amber); border-radius: 6px; padding: 1px 6px; margin-left: 8px; }
+  .agenda-cards { margin-top: 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--card); }
+  .agenda-cards summary { cursor: pointer; padding: 12px 16px; font-weight: 600; font-size: 13px; }
+  #agendaList { max-height: 60vh; overflow: auto; padding: 0 12px 12px; display: flex; flex-direction: column; gap: 6px; }
+  .result-item.is-agenda { padding: 8px 12px; background: var(--bg); border-radius: 9px; font-size: 12.5px; line-height: 1.5; }
+  .result-item.is-agenda .a-sec { font-weight: 700; color: var(--primary); margin-right: 8px; white-space: nowrap; }
+  .arr-item.is-new { border-color: var(--amber); background: var(--amber-soft); }
+  .arr-item.locked { cursor: default; background: transparent; }
+  .arr-item.locked .arr-num { color: var(--text-muted); }
+  .arr-section h4.arr-head { cursor: pointer; display: flex; align-items: center; gap: 6px; user-select: none; }
+  .arr-section h4.arr-head .ic { width: 14px; height: 14px; transition: transform .12s; }
+  .arr-section.open h4.arr-head .ic { transform: rotate(90deg); }
+  .arr-count { color: var(--text-muted); font-weight: 500; font-size: 12px; }
+  .arr-section:not(.open) .arr-list { min-height: 8px; }
+  .arrange { display: none; margin-top: 20px; background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: var(--shadow); padding: 20px 22px; }
+  .arrange h3 { margin: 0 0 4px; font-size: 16px; }
+  .arrange .arr-sub { color: var(--text-muted); font-size: 13px; line-height: 1.5; margin-bottom: 6px; }
+  .arr-note { color: var(--text-muted); font-size: 13.5px; line-height: 1.55; padding: 6px 0; }
+  .arr-section h4 { font-size: 14px; font-weight: 700; margin: 18px 0 8px; }
+  .arr-list { min-height: 34px; border: 1px dashed transparent; border-radius: 10px; padding: 3px; transition: background .12s, border-color .12s; }
+  .arr-list.over { border-color: var(--primary); background: var(--primary-soft); }
+  .arr-empty { color: var(--text-muted); font-size: 12.5px; padding: 8px 10px; }
+  .arr-item { display: flex; gap: 10px; align-items: flex-start; padding: 9px 10px; margin-bottom: 6px;
+    border: 1px solid var(--border); border-radius: 10px; background: var(--bg); cursor: grab; }
+  .arr-item:last-child { margin-bottom: 0; }
+  .arr-item:active { cursor: grabbing; }
+  .arr-item.dragging { opacity: .4; }
+  .arr-item.drop-before { box-shadow: 0 -3px 0 0 var(--primary); }
+  .arr-item.drop-after { box-shadow: 0 3px 0 0 var(--primary); }
+  .arr-item.moved { animation: movedflash 1.4s ease-out; }
+  @keyframes movedflash { from { box-shadow: 0 0 0 3px var(--primary); } to { box-shadow: 0 0 0 0 transparent; } }
+  .arr-grip { color: var(--text-muted); flex: none; margin-top: 2px; display: flex; }
+  .arr-grip .ic { width: 16px; height: 16px; }
+  .arr-num { font-weight: 700; color: var(--primary); flex: none; min-width: 24px; font-size: 13px; padding-top: 1px; }
+  .arr-body { flex: 1; min-width: 0; }
+  .arr-title { font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+  .arr-file { color: var(--text-muted); font-size: 11px; margin-top: 2px; }
+  .arr-btns { display: flex; flex-direction: column; gap: 3px; flex: none; }
+  .arr-btns button { border: 1px solid var(--border); background: transparent; color: var(--text-muted);
+    border-radius: 6px; padding: 2px 5px; cursor: pointer; display: flex; }
+  .arr-btns button:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
+  .arr-btns button:disabled { opacity: .3; cursor: default; }
+  .arr-btns .ic { width: 13px; height: 13px; }
   .r-sections { display: flex; flex-wrap: wrap; gap: 6px; }
   .section-btn {
     border: 1px solid var(--border); background: transparent; color: var(--text-muted);
@@ -555,6 +819,15 @@ PAGE = """
     cursor: pointer; transition: background .15s, color .15s, border-color .15s;
   }
   .section-btn:hover { border-color: var(--primary); color: var(--primary); }
+  .section-btn .ic { width: 12px; height: 12px; margin-left: 4px; vertical-align: -2px; }
+  .sec-menu { position: fixed; z-index: 950; min-width: 240px; max-width: min(420px, calc(100vw - 16px));
+    max-height: 60vh; overflow: auto; background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    box-shadow: var(--shadow); padding: 4px; }
+  .sec-menu[hidden] { display: none; }
+  .sec-menu-item { display: block; width: 100%; text-align: left; border: 0; background: none; color: var(--text);
+    font-size: 12.5px; line-height: 1.4; padding: 7px 12px; border-radius: 7px; cursor: pointer; white-space: normal; }
+  .sec-menu-item:hover { background: var(--primary-soft); }
+  .sec-menu-item.current { color: var(--primary); font-weight: 700; }
   .section-btn.active { background: var(--primary); border-color: var(--primary); color: #fff; }
 
   .reminder-panel {
@@ -573,12 +846,15 @@ PAGE = """
   }
   .reminder-panel li:last-child { margin-bottom: 0; }
   .reminder-panel li .s-num { flex-shrink: 0; font-weight: 700; color: var(--text-muted); }
-  .reminder-panel li .s-text { flex: 1; }
+  .reminder-panel li .s-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
   .reminder-panel li .s-edit-btn {
     flex-shrink: 0; border: none; background: none; cursor: pointer;
     font-size: 14px; color: var(--text-muted); opacity: .6; padding: 0 2px; line-height: 1.6; transition: opacity .15s;
   }
   .reminder-panel li .s-edit-btn:hover { opacity: 1; }
+  .reminder-panel li .s-edit-btn .ic { width: 14px; height: 14px; }
+  .reminder-panel li .s-del:hover { color: var(--red); }
+  .reminder-panel li .s-add:hover { color: var(--primary); }
   .reminder-panel li .s-input {
     flex: 1; font: inherit; padding: 2px 6px; border: 1px solid var(--primary);
     border-radius: 5px; background: var(--card); color: var(--text);
@@ -663,11 +939,15 @@ PAGE = """
       <button class="fclear" id="fclear" title="Прибрати файл"><svg class="ic"><use href="#i-x"/></svg></button>
     </div>
 
-    <label class="field-label" for="outdir">Папка для збереження</label>
-    <div class="field-wrap">
-      <span class="fi-prefix"><svg class="ic"><use href="#i-folder"/></svg></span>
-      <input type="text" id="outdir" value="{{ default_out_dir }}">
+    <label class="field-label" for="outdir">Робоча папка</label>
+    <div class="field-row">
+      <div class="field-wrap">
+        <span class="fi-prefix"><svg class="ic"><use href="#i-folder"/></svg></span>
+        <input type="text" id="outdir" value="{{ default_out_dir }}">
+      </div>
+      <button type="button" class="pick-btn" id="pickDirBtn" hidden>Обрати…</button>
     </div>
+    <div class="field-hint">Сюди скачуються файли, і звідси дерево зліва їх читає. Можна вказати власну папку або обрати ту, де вже лежать скачані файли.</div>
 
     <button class="primary" id="startBtn" disabled>
       <span class="spinner" id="spinner"></span>
@@ -700,14 +980,14 @@ PAGE = """
   </div>
 
   <div class="panel" id="panel-generate" hidden>
-  <p class="panel-desc">Перетягніть сюди проєкти рішень (PDF, можна одразу кілька сотень) — для кожного файлу скрипт визначить номер рішення за назвою й перевірить його на сайті КМР</p>
+  <p class="panel-desc">Перетягніть сюди проєкти рішень (PDF, можна одразу кілька сотень) — для кожного файлу скрипт визначить за назвою номер і рік рішення (напр. 183-25.pdf — №183 за 2025 рік) і знайде його на сайті КМР</p>
   <div class="card">
     <div class="dropzone" id="dropGen">
       <div class="drop-icon"><svg class="ic"><use href="#i-upload"/></svg></div>
       <div class="drop-main">Перетягніть сюди файли проєктів рішень</div>
-      <div class="drop-sub">або натисніть, щоб обрати файли (напр. "524-26.pdf") — підтримується масове завантаження</div>
+      <div class="drop-sub">або натисніть, щоб обрати файли (напр. "524-26.pdf"). Можна одразу кілька, а можна по одному — список накопичується. Разом із ними можна додати й порядок денний (Word .docx або PDF): нові пункти вставляться в нього</div>
     </div>
-    <input type="file" id="fileGen" accept="application/pdf" multiple>
+    <input type="file" id="fileGen" accept="application/pdf,.docx" multiple>
 
     <div class="file-chip" id="fileChipGen">
       <div class="fi"><svg class="ic"><use href="#i-paperclip"/></svg></div>
@@ -715,8 +995,9 @@ PAGE = """
         <div class="fname" id="fnameGen"></div>
         <div class="fsize" id="fsizeGen"></div>
       </div>
-      <button class="fclear" id="fclearGen" title="Прибрати файли"><svg class="ic"><use href="#i-x"/></svg></button>
+      <button class="fclear" id="fclearGen" title="Очистити список"><svg class="ic"><use href="#i-x"/></svg></button>
     </div>
+    <div class="pending-list" id="pendingListGen"></div>
 
     <button class="primary" id="startBtnGen" disabled>
       <span class="spinner" id="spinnerGen"></span>
@@ -733,6 +1014,11 @@ PAGE = """
         <div class="stat skip"><div class="n" id="statSkipGen">–</div><div class="l">помилок</div></div>
       </div>
 
+      <details class="log-details audit-details" id="auditDetailsGen" open>
+        <summary><span class="chev"><svg class="ic"><use href="#i-chevron-right"/></svg></span> <span id="auditTitleGen">Назви файлів</span></summary>
+        <div class="audit-list" id="auditListGen"></div>
+      </details>
+
       <button class="secondary" id="openBtnGen" style="display:none">Показати папку</button>
 
       <details class="log-details" id="logDetailsGen">
@@ -743,14 +1029,28 @@ PAGE = """
   </div>
 
   <div class="results-layout" id="resultsLayout">
-    <div class="results-list" id="resultsList"></div>
+    <div class="results-col">
+      <div class="new-info" id="newInfo"></div>
+      <div class="results-list" id="resultsList"></div>
+      <details class="agenda-cards" id="agendaCards" style="display:none">
+        <summary>Пункти з порядку денного (<span id="agendaCount">0</span>) — розділи вже обрано, вони стоять на своїх місцях</summary>
+        <div id="agendaList"></div>
+      </details>
+    </div>
     <div class="reminder-panel">
       <h3>Розділи порядку денного</h3>
       <ol id="sectionsList"></ol>
     </div>
   </div>
 
+  <div class="arrange" id="arrangePanel">
+    <h3>Порядок у документі</h3>
+    <div class="arr-sub">Так пункти стоятимуть у документі. Перетягуйте їх мишкою (навіть в інший розділ) або користуйтеся стрілками справа.</div>
+    <div id="arrangeBody"></div>
+  </div>
+
   <button class="primary" id="generateBtn">Згенерувати ПД</button>
+  <button class="secondary" id="newBatchBtn" style="display:none">Очистити список і почати заново</button>
   </div>
 
   <div class="foot">Працює локально · нічого не надсилається за межі цього комп'ютера</div>
@@ -1453,6 +1753,44 @@ const startLabel = document.getElementById('startLabel');
 const spinner = document.getElementById('spinner');
 const openBtn = document.getElementById('openBtn');
 const outdirInput = document.getElementById('outdir');
+const pickDirBtn = document.getElementById('pickDirBtn');
+let lastWorkDir = outdirInput.value;
+
+// Зберігає робочу папку на сервері; після успіху дерево показує її вміст.
+async function saveWorkDir() {
+  const value = outdirInput.value.trim();
+  if (value === lastWorkDir) return;
+  try {
+    const resp = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ work_dir: value }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.error || ('Помилка ' + resp.status));
+    lastWorkDir = outdirInput.value = data.work_dir;
+    showToast('Робочу папку збережено: ' + data.work_dir, 'ok');
+    refreshTree();
+  } catch (e) {
+    outdirInput.value = lastWorkDir;  // лишаємо останню робочу
+    showToast(e.message);
+  }
+}
+outdirInput.addEventListener('change', saveWorkDir);
+outdirInput.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); saveWorkDir(); } });
+
+// Системне вікно вибору папки є лише у вікні програми (pywebview); у браузері шлях вводять вручну.
+function updatePickButton() {
+  pickDirBtn.hidden = !(window.pywebview && window.pywebview.api && window.pywebview.api.pick_folder);
+}
+window.addEventListener('pywebviewready', updatePickButton);
+updatePickButton();
+pickDirBtn.addEventListener('click', async () => {
+  try {
+    const chosen = await window.pywebview.api.pick_folder(outdirInput.value);
+    if (chosen) { outdirInput.value = chosen; await saveWorkDir(); }
+  } catch (e) { showToast('Не вдалося відкрити вікно вибору папки: ' + e); }
+});
 const logEl = document.getElementById('log');
 const progressWrap = document.getElementById('progressWrap');
 const statusText = document.getElementById('statusText');
@@ -1628,6 +1966,7 @@ function auditRow(i) {
   const text = document.createElement('span');
   text.innerHTML = '<span class="a-kind">' + escapeHtml(i.kind) + '</span>' +
     '<span class="a-where">' + escapeHtml(where) + '</span>' +
+    (i.pr ? '<span class="a-pr">' + escapeHtml(i.pr) + '</span>' : '') +
     '<span class="a-text">' + escapeHtml(i.text) + '</span>';
   head.append(cb, text);
   row.appendChild(head);
@@ -1646,7 +1985,7 @@ function auditFixForm(i, row) {
     i.extra.items.forEach((it, idx) => {
       const o = document.createElement('option');
       o.value = String(idx);
-      o.textContent = 'пункт ' + it.num;
+      o.textContent = 'пункт ' + it.num + (it.pr ? ' · ' + it.pr : '');
       pick.appendChild(o);
     });
     pick.value = String(i.extra.items.length - 1);
@@ -1836,10 +2175,31 @@ const resultsList = document.getElementById('resultsList');
 const generateBtn = document.getElementById('generateBtn');
 const toastStack = document.getElementById('toastStack');
 
-let selectedFilesGen = [];
+let agendaActive = false;           // у завданні є порядок денний: дерево розділів — його власне
+let lockedSections = new Set();    // заголовки з порядку денного (не перейменовуються й не видаляються)
+const arrToggle = new Map();       // розділ -> розгорнутий/згорнутий вручну (блок "Порядок у документі")
+const newInfo = document.getElementById('newInfo');
+const agendaCards = document.getElementById('agendaCards');
+const agendaList = document.getElementById('agendaList');
+const agendaCount = document.getElementById('agendaCount');
+let selectedFilesGen = [];      // черга: файли, додані, але ще не відправлені на обробку
+let runningGen = false;
+const processedNamesGen = new Set();  // імена вже відправлених файлів (щоб не додати двічі)
+const pendingListGen = document.getElementById('pendingListGen');
+const newBatchBtn = document.getElementById('newBatchBtn');
 let currentJobGen = null;
 let pollTimerGen = null;
 let renderedResultsCount = 0;
+
+const auditDetailsGen = document.getElementById('auditDetailsGen');
+const auditListGen = document.getElementById('auditListGen');
+const auditTitleGen = document.getElementById('auditTitleGen');
+let auditItemsGen = [];        // поточні зауваження до назв файлів (як їх повернув сервер)
+let auditSignatureGen = '';
+let awaitingGen = false;       // є некоректні назви: обробка чекає
+let proceedingGen = false;
+const skippedGen = new Set();  // id файлів, позначених галочкою (пропустити)
+const draftsGen = new Map();   // id -> введена, але ще не збережена нова назва
 
 function showToast(message, kind) {
   const toast = document.createElement('div');
@@ -1853,39 +2213,105 @@ function showToast(message, kind) {
   }, 6000);
 }
 
-// ---- Розділи порядку денного (редаговані назви, зберігаються на диску) ----
+// ---- Розділи порядку денного: дерево до 4 рівнів (1, 1.1, 1.1.1, 1.1.1.1), назви редагуються й зберігаються ----
 const sectionsList = document.getElementById('sectionsList');
-let sectionTitles = {};
+const MAX_SECTION_DEPTH = 4;
+let sectionTitles = {};   // id -> назва
+let sectionOrder = [];    // id у порядку документа: 1, 1.1, 1.1.1, 1.2, 2, …
+const sectionDepth = id => id.split('.').length;
+const sectionChildren = id => sectionOrder.filter(x => x.startsWith(id + '.') && sectionDepth(x) === sectionDepth(id) + 1);
+const sectionBranch = id => sectionOrder.filter(x => x === id || x.startsWith(id + '.'));  // розділ і все вкладене
+const topSections = () => sectionOrder.filter(id => sectionDepth(id) === 1);
 
-function renderSectionItem(num, title) {
+function applySections(data) {
+  sectionTitles = data.sections || {};
+  sectionOrder = data.order || [];
+  lockedSections = new Set(data.locked || []);
+  renderSectionsList();
+  rebuildCardSections();  // кнопки розділів на картках залежать від наявних підрозділів
+  renderArrange();
+}
+
+function renderSectionsList() {
+  sectionsList.textContent = '';
+  sectionOrder.forEach(id => sectionsList.appendChild(renderSectionItem(id)));
+}
+
+function sectionIconButton(cls, iconName, title, handler) {
+  const b = document.createElement('button');
+  b.className = 's-edit-btn ' + cls;
+  b.type = 'button';
+  b.title = title;
+  b.appendChild(icon(iconName));
+  b.addEventListener('click', handler);
+  return b;
+}
+
+function renderSectionItem(id) {
+  const depth = sectionDepth(id);
   const li = document.createElement('li');
-  li.dataset.section = num;
+  li.dataset.section = id;
+  li.style.paddingLeft = ((depth - 1) * 10) + 'px';
 
   const numEl = document.createElement('span');
   numEl.className = 's-num';
-  numEl.textContent = num + '.';
+  numEl.textContent = id + '.';
   li.appendChild(numEl);
 
   const textEl = document.createElement('span');
   textEl.className = 's-text';
-  textEl.textContent = title;
+  textEl.textContent = sectionTitles[id];
   li.appendChild(textEl);
 
-  const editBtn = document.createElement('button');
-  editBtn.className = 's-edit-btn';
-  editBtn.type = 'button';
-  editBtn.title = 'Змінити назву розділу';
-  editBtn.appendChild(icon('pencil'));
-  editBtn.addEventListener('click', () => startEditingSection(li, num));
-  li.appendChild(editBtn);
-
+  const locked = lockedSections.has(id);
+  if (!locked) li.appendChild(sectionIconButton('s-rename', 'pencil', 'Змінити назву', () => startEditingSection(li, id)));
+  if (depth < MAX_SECTION_DEPTH) {
+    li.appendChild(sectionIconButton('s-add', 'plus', 'Додати підрозділ', () => addSubsection(id)));
+  }
+  if (depth > 1 && !locked) {
+    li.appendChild(sectionIconButton('s-del', 'trash-2', 'Видалити підрозділ', () => deleteSubsection(id)));
+  }
   return li;
 }
 
-function startEditingSection(li, num) {
+async function sectionsApi(url, body) {
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(agendaActive ? { ...body, job_id: currentJobGen } : body),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || data.error) throw new Error(data.error || ('Помилка ' + resp.status));
+  return data;
+}
+
+// Додає підрозділ (1 -> 1.1, 1.1 -> 1.1.1 …) і одразу відкриває поле для його назви.
+async function addSubsection(parent) {
+  try {
+    const data = await sectionsApi('/api/sections/add', { parent });
+    applySections(data);
+    const li = sectionsList.querySelector('li[data-section="' + data.id + '"]');
+    if (li) { li.scrollIntoView({ block: 'nearest' }); startEditingSection(li, data.id); }
+  } catch (e) { showToast(e.message); }
+}
+
+async function deleteSubsection(id) {
+  const kids = sectionBranch(id).length - 1;
+  const used = resultsData.filter(r => r.section && (r.section === id || r.section.startsWith(id + '.'))).length;
+  const text = 'Підрозділ «' + id + ' ' + sectionTitles[id] + '»' + (kids ? ' разом із вкладеними (' + kids + ')' : '') +
+    ' буде видалено.' + (used ? ' Картки з нього (' + used + ') повернуться в розділ вище.' : '') +
+    ' Номери наступних підрозділів зсунуться.';
+  if (!(await mpConfirm('Видалити підрозділ?', text, 'Видалити'))) return;
+  try {
+    applySections(await sectionsApi('/api/sections/delete', { section: id }));
+    await syncResultsFromServer();  // картки з видалених підрозділів сервер уже переніс
+  } catch (e) { showToast(e.message); }
+}
+
+function startEditingSection(li, id) {
   const textEl = li.querySelector('.s-text');
-  const editBtn = li.querySelector('.s-edit-btn');
-  const currentTitle = sectionTitles[num] || '';
+  const buttons = li.querySelectorAll('.s-edit-btn');
+  const currentTitle = sectionTitles[id] || '';
 
   const input = document.createElement('input');
   input.className = 's-input';
@@ -1893,7 +2319,7 @@ function startEditingSection(li, num) {
   input.value = currentTitle;
 
   textEl.replaceWith(input);
-  editBtn.style.display = 'none';
+  buttons.forEach(b => { b.style.display = 'none'; });
   input.focus();
   input.select();
 
@@ -1904,28 +2330,18 @@ function startEditingSection(li, num) {
     const newTitle = input.value.trim();
     if (save && newTitle && newTitle !== currentTitle) {
       try {
-        const resp = await fetch('/api/sections', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ section: num, title: newTitle }),
-        });
-        const data = await resp.json();
-        if (data.error) {
-          showToast('Помилка: ' + data.error);
-          sectionTitles[num] = currentTitle;
-        } else {
-          sectionTitles[num] = newTitle;
-        }
+        const data = await sectionsApi('/api/sections', { section: id, title: newTitle });
+        sectionTitles = data.sections;
       } catch (e) {
-        showToast('Помилка мережі під час збереження назви розділу');
-        sectionTitles[num] = currentTitle;
+        showToast(e.message.startsWith('Помилка') ? 'Помилка мережі під час збереження назви розділу' : 'Помилка: ' + e.message);
       }
     }
     const newTextEl = document.createElement('span');
     newTextEl.className = 's-text';
-    newTextEl.textContent = sectionTitles[num];
+    newTextEl.textContent = sectionTitles[id];
     input.replaceWith(newTextEl);
-    editBtn.style.display = '';
+    buttons.forEach(b => { b.style.display = ''; });
+    renderArrange();
   };
 
   input.addEventListener('keydown', e => {
@@ -1938,12 +2354,7 @@ function startEditingSection(li, num) {
 async function loadSections() {
   try {
     const resp = await fetch('/api/sections');
-    const data = await resp.json();
-    sectionTitles = data.sections || {};
-    sectionsList.innerHTML = '';
-    for (let n = 1; n <= 6; n++) {
-      sectionsList.appendChild(renderSectionItem(n, sectionTitles[n]));
-    }
+    applySections(await resp.json());
   } catch (e) { /* панель лишиться порожньою, не критично */ }
 }
 loadSections();
@@ -1954,39 +2365,100 @@ dropGen.addEventListener('dragleave', () => dropGen.classList.remove('hover'));
 dropGen.addEventListener('drop', e => {
   e.preventDefault();
   dropGen.classList.remove('hover');
-  if (e.dataTransfer.files.length) setFilesGen(e.dataTransfer.files);
+  if (e.dataTransfer.files.length) addFilesGen(e.dataTransfer.files);
 });
-fileInputGen.addEventListener('change', () => { if (fileInputGen.files.length) setFilesGen(fileInputGen.files); });
+fileInputGen.addEventListener('change', () => {
+  if (fileInputGen.files.length) addFilesGen(fileInputGen.files);
+  fileInputGen.value = '';  // щоб той самий файл можна було обрати ще раз після видалення зі списку
+});
 
 fclearGen.addEventListener('click', e => {
   e.stopPropagation();
   selectedFilesGen = [];
-  fileInputGen.value = '';
-  fileChipGen.style.display = 'none';
-  dropGen.style.display = 'block';
-  startBtnGen.disabled = true;
+  renderPendingGen();
 });
 
-function setFilesGen(fileList) {
-  selectedFilesGen = Array.from(fileList);
-  const totalSize = selectedFilesGen.reduce((sum, f) => sum + f.size, 0);
-  fnameGen.textContent = selectedFilesGen.length === 1
-    ? selectedFilesGen[0].name
-    : `${selectedFilesGen.length} файлів обрано`;
-  fsizeGen.textContent = humanSize(totalSize);
-  dropGen.style.display = 'none';
-  fileChipGen.style.display = 'flex';
-  startBtnGen.disabled = selectedFilesGen.length === 0;
+// Файли додаються до черги, а не замінюють її: можна кидати по одному, скільки потрібно.
+function addFilesGen(fileList) {
+  const notPdf = [], dup = [];
+  for (const f of Array.from(fileList)) {
+    if (!/[.](pdf|docx)$/i.test(f.name)) notPdf.push(f.name);
+    else if (selectedFilesGen.some(x => x.name === f.name) || processedNamesGen.has(f.name)) dup.push(f.name);
+    else selectedFilesGen.push(f);
+  }
+  if (notPdf.length) showToast('Лише PDF і Word (.docx). Пропущено: ' + notPdf.slice(0, 3).join(', ') + (notPdf.length > 3 ? '…' : ''));
+  if (dup.length) showToast('Уже додано або оброблено: ' + dup.slice(0, 3).join(', ') + (dup.length > 3 ? '…' : ''));
+  renderPendingGen();
+}
+
+function renderPendingGen() {
+  const n = selectedFilesGen.length;
+  pendingListGen.textContent = '';
+  fileChipGen.style.display = n ? 'flex' : 'none';
+  pendingListGen.style.display = n ? 'block' : 'none';
+  if (n) {
+    fnameGen.textContent = 'Файлів у черзі: ' + n;
+    fsizeGen.textContent = humanSize(selectedFilesGen.reduce((sum, f) => sum + f.size, 0));
+  }
+  selectedFilesGen.forEach(f => {
+    const row = document.createElement('div');
+    row.className = 'p-row';
+    const name = document.createElement('span');
+    name.className = 'p-name';
+    name.textContent = f.name;
+    name.title = f.name;
+    const size = document.createElement('span');
+    size.className = 'p-size';
+    size.textContent = humanSize(f.size);
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'p-del';
+    del.title = 'Прибрати з черги';
+    del.appendChild(icon('x'));
+    del.addEventListener('click', () => {
+      selectedFilesGen = selectedFilesGen.filter(x => x !== f);
+      renderPendingGen();
+    });
+    row.append(name, size);
+    if (/[.]docx$/i.test(f.name) || !/^[0-9]+-[0-9]{2,4}/.test(f.name)) {
+      const tag = document.createElement('span');
+      tag.className = 'new-badge';
+      tag.textContent = /[.]docx$/i.test(f.name) ? 'порядок денний' : 'можливо, порядок денний';
+      tag.style.marginLeft = '0';
+      row.appendChild(tag);
+    }
+    row.append(del);
+    pendingListGen.appendChild(row);
+  });
+  updateStartGen();
+}
+
+function updateStartGen() {
+  startBtnGen.disabled = runningGen || selectedFilesGen.length === 0;
+  spinnerGen.style.display = runningGen ? 'inline-block' : 'none';
+  startLabelGen.textContent = runningGen ? 'Виконується…'
+    : (selectedFilesGen.length ? 'Обробити файлів: ' + selectedFilesGen.length : 'Почати');
 }
 
 function setRunningGen(running) {
-  startBtnGen.disabled = running;
-  spinnerGen.style.display = running ? 'inline-block' : 'none';
-  startLabelGen.textContent = running ? 'Виконується…' : 'Почати';
+  runningGen = running;
+  updateStartGen();
 }
 
-startBtnGen.addEventListener('click', async () => {
-  if (!selectedFilesGen.length) return;
+// Виходить із режиму порядку денного: повертає загальне дерево розділів і прибирає його картки.
+function resetAgendaUi() {
+  const wasActive = agendaActive;
+  agendaActive = false;
+  lockedSections = new Set();
+  arrToggle.clear();
+  agendaList.textContent = '';
+  agendaCards.style.display = 'none';
+  agendaCount.textContent = '0';
+  newInfo.textContent = '';
+  if (wasActive) loadSections();
+}
+
+function resetRunUiGen(message, keepResults) {
   setRunningGen(true);
   openBtnGen.style.display = 'none';
   statsGen.style.display = 'none';
@@ -1995,14 +2467,37 @@ startBtnGen.addEventListener('click', async () => {
   logGen.textContent = '';
   barFillGen.style.width = '0%';
   statusPctGen.textContent = '';
-  statusTextGen.textContent = `Завантажуємо ${selectedFilesGen.length} файлів…`;
-  resultsList.innerHTML = '';
-  resultsLayout.style.display = 'none';
-  generateBtn.style.display = 'none';
-  renderedResultsCount = 0;
+  statusTextGen.textContent = message;
+  if (!keepResults) {
+    resetAgendaUi();
+    resultsList.innerHTML = '';
+    resultsData = [];
+    renderArrange();
+    resultsLayout.style.display = 'none';
+    generateBtn.style.display = 'none';
+    newBatchBtn.style.display = 'none';
+    renderedResultsCount = 0;
+  }
+  awaitingGen = false;
+  proceedingGen = false;
+  auditItemsGen = [];
+  auditSignatureGen = '';
+  auditListGen.textContent = '';
+  auditDetailsGen.style.display = 'none';
+  skippedGen.clear();
+  draftsGen.clear();
+}
+
+startBtnGen.addEventListener('click', async () => {
+  if (!selectedFilesGen.length) return;
+  // Якщо вже є оброблені результати — нові файли дописуються до них, а не замінюють їх.
+  const append = !!currentJobGen && renderedResultsCount > 0;
+  const prevJob = append ? currentJobGen : null;
+  resetRunUiGen(`Завантажуємо файлів: ${selectedFilesGen.length}…`, append);
 
   const form = new FormData();
   for (const f of selectedFilesGen) form.append('files', f);
+  if (prevJob) form.append('prev_job', prevJob);
 
   let resp, data;
   try {
@@ -2018,16 +2513,41 @@ startBtnGen.addEventListener('click', async () => {
     setRunningGen(false);
     return;
   }
+  selectedFilesGen.forEach(f => processedNamesGen.add(f.name));
+  selectedFilesGen = [];
+  renderPendingGen();
   currentJobGen = data.job_id;
   pollGen();
+});
+
+newBatchBtn.addEventListener('click', async () => {
+  const sure = await mpConfirm('Почати заново?',
+    'Список оброблених проєктів буде очищено, щоб скласти новий. Уже створений документ залишиться.', 'Очистити');
+  if (!sure) return;
+  clearInterval(pollTimerGen);
+  currentJobGen = null;
+  renderedResultsCount = 0;
+  resetAgendaUi();
+  resultsList.innerHTML = '';
+  resultsData = [];
+  renderArrange();
+  resultsLayout.style.display = 'none';
+  generateBtn.style.display = 'none';
+  newBatchBtn.style.display = 'none';
+  progressWrapGen.style.display = 'none';
+  processedNamesGen.clear();
+  selectedFilesGen = [];
+  setRunningGen(false);
+  renderPendingGen();
 });
 
 function renderLogGen(lines) {
   const html = lines.map(l => {
     const esc = escapeHtml(l);
     if (l.startsWith('[+]')) return '<span class="l-ok">' + esc + '</span>';
+    if (l.startsWith('[~]')) return '<span class="l-skip">' + esc + '</span>';
     if (l.startsWith('[!]')) return '<span class="l-err">' + esc + '</span>';
-    if (l.startsWith('Знайдено') || l.startsWith('Готово')) return '<span class="l-head">' + esc + '</span>';
+    if (l.startsWith('Знайдено') || l.startsWith('Готово') || l.startsWith('Перевірка')) return '<span class="l-head">' + esc + '</span>';
     return esc;
   }).join('\\n');
   logGen.innerHTML = html;
@@ -2063,22 +2583,292 @@ function updateProgressGen(lines) {
   }
 }
 
+// ---- Порядок у документі: пункти згруповані за розділами, як у документі ----
+const arrangePanel = document.getElementById('arrangePanel');
+const arrangeBody = document.getElementById('arrangeBody');
+let dragIndex = null;
+
+// Пункти розділу в порядку документа: спершу розставлені користувачем (rank), далі як завантажено.
+function sectionItems(section) {
+  return resultsData.map((r, i) => ({ r, i })).filter(x => x.r.section === section)
+    .sort((a, b) => ((a.r.rank == null ? 1e9 : a.r.rank) - (b.r.rank == null ? 1e9 : b.r.rank)) || (a.i - b.i));
+}
+
+function renderArrange(movedIndex) {
+  arrangeBody.textContent = '';
+  if (!resultsData.length) { arrangePanel.style.display = 'none'; return; }
+  arrangePanel.style.display = 'block';
+  const missing = resultsData.filter(r => !r.locked && r.section == null).length;
+  if (missing) {
+    const note = document.createElement('div');
+    note.className = 'arr-note';
+    note.textContent = 'Оберіть розділ для всіх ' + (agendaActive ? 'нових карток' : 'карток') + ' вище (лишилось: ' + missing +
+      ') — тоді тут з’явиться список у тому порядку, у якому пункти стоятимуть у документі, і їх можна буде переставляти.';
+    arrangeBody.appendChild(note);
+    return;
+  }
+  for (const section of sectionOrder) {
+    const items = sectionItems(section);
+    const fresh = items.filter(x => !x.r.locked).length;
+    // Розділи з новими пунктами (і короткі) розгорнуті, великі розділи порядку денного — згорнуті.
+    const open = arrToggle.has(section) ? arrToggle.get(section) : (fresh > 0 || items.length <= 6);
+    const block = document.createElement('div');
+    block.className = 'arr-section' + (open ? ' open' : '');
+    block.style.marginLeft = ((sectionDepth(section) - 1) * 20) + 'px';
+    const head = document.createElement('h4');
+    head.className = 'arr-head';
+    const count = document.createElement('span');
+    count.className = 'arr-count';
+    count.textContent = '(' + items.length + (agendaActive && fresh ? ', нових: ' + fresh : '') + ')';
+    head.append(icon('chevron-right'), document.createTextNode(section + ') ' + (sectionTitles[section] || '') + ':'), count);
+    head.addEventListener('click', () => { arrToggle.set(section, !open); renderArrange(); });
+    const list = document.createElement('div');
+    list.className = 'arr-list';
+    list.dataset.section = section;
+    if (open) {
+      if (!items.length) {
+        const empty = document.createElement('div');
+        empty.className = 'arr-empty';
+        empty.textContent = 'Немає пунктів — можна перетягнути сюди.';
+        list.appendChild(empty);
+      }
+      items.forEach((entry, pos) => list.appendChild(arrangeRow(entry, pos, items.length, section, movedIndex)));
+    }
+    block.append(head, list);
+    arrangeBody.appendChild(block);
+  }
+}
+
+function arrangeRow(entry, pos, total, section, movedIndex) {
+  const locked = !!entry.r.locked;
+  const row = document.createElement('div');
+  row.className = 'arr-item' + (entry.i === movedIndex ? ' moved' : '') + (locked ? ' locked' : (agendaActive ? ' is-new' : ''));
+  row.draggable = !locked;
+  row.dataset.index = String(entry.i);
+
+  const grip = document.createElement('span');
+  grip.className = 'arr-grip';
+  if (!locked) grip.appendChild(icon('grip-vertical'));
+  else grip.style.width = '16px';
+  const num = document.createElement('span');
+  num.className = 'arr-num';
+  num.textContent = (pos + 1) + ')';
+  const body = document.createElement('div');
+  body.className = 'arr-body';
+  const title = document.createElement('div');
+  title.className = 'arr-title';
+  title.textContent = (entry.r.line || '').trim();
+  body.appendChild(title);
+  if (!locked) {
+    const file = document.createElement('div');
+    file.className = 'arr-file';
+    file.textContent = entry.r.filename;
+    if (agendaActive) {
+      const badge = document.createElement('span');
+      badge.className = 'new-badge';
+      badge.textContent = 'Новий';
+      file.appendChild(badge);
+    }
+    body.appendChild(file);
+  }
+  row.append(grip, num, body);
+
+  if (!locked) {  // пункти з порядку денного нерухомі; лише нові можна переставляти
+    const btns = document.createElement('div');
+    btns.className = 'arr-btns';
+    const up = document.createElement('button');
+    up.type = 'button';
+    up.title = 'Вище в розділі';
+    up.disabled = pos === 0;
+    up.appendChild(icon('arrow-up'));
+    up.addEventListener('click', () => arrangeMove(entry.i, section, pos - 1));
+    const down = document.createElement('button');
+    down.type = 'button';
+    down.title = 'Нижче в розділі';
+    down.disabled = pos === total - 1;
+    down.appendChild(icon('arrow-down'));
+    down.addEventListener('click', () => arrangeMove(entry.i, section, pos + 1));
+    btns.append(up, down);
+    row.appendChild(btns);
+  }
+  return row;
+}
+
+// position — місце серед пунктів розділу без самого пункту (0 — першим).
+async function arrangeMove(index, section, position) {
+  try {
+    const resp = await fetch('/api/generate/arrange', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_id: currentJobGen, index, section, position }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.error || ('Помилка ' + resp.status));
+    data.results.forEach((r, i) => { resultsData[i] = resultFields(r); });
+    // картки лишаються на місці, але підсвітка розділу в них має відповідати
+    resultsList.querySelectorAll('.result-item').forEach((card, i) => {
+      /* кнопки розділів перебудовуються нижче */
+    });
+    rebuildCardSections();
+    renderArrange(index);
+    setTimeout(() => arrangeBody.querySelectorAll('.arr-item.moved').forEach(e => e.classList.remove('moved')), 1500);
+  } catch (e) { showToast(e.message); }
+}
+
+// Список розділу під курсором: сам список або (для заголовка, зокрема згорнутого розділу) список цього розділу.
+function dropList(el) {
+  const list = el.closest('.arr-list');
+  if (list) return list;
+  const sec = el.closest('.arr-section');
+  return sec ? sec.querySelector('.arr-list') : null;
+}
+
+function clearDropMarks() {
+  arrangeBody.querySelectorAll('.drop-before, .drop-after, .over').forEach(e => e.classList.remove('drop-before', 'drop-after', 'over'));
+}
+
+// Куди впаде пункт: перед/після рядка, над яким курсор, або в кінець розділу (порожнє місце списку).
+function dropTarget(e, list) {
+  const row = e.target.closest('.arr-item');
+  if (row && list.contains(row)) {
+    const rect = row.getBoundingClientRect();
+    return { row, before: e.clientY < rect.top + rect.height / 2 };
+  }
+  return null;
+}
+
+arrangeBody.addEventListener('dragstart', e => {
+  const row = e.target.closest ? e.target.closest('.arr-item') : null;
+  if (!row) return;
+  dragIndex = parseInt(row.dataset.index, 10);
+  row.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+  try { e.dataTransfer.setData('text/plain', String(dragIndex)); } catch (err) { /* не критично */ }
+});
+arrangeBody.addEventListener('dragend', () => {
+  dragIndex = null;
+  clearDropMarks();
+  arrangeBody.querySelectorAll('.dragging').forEach(e => e.classList.remove('dragging'));
+});
+arrangeBody.addEventListener('dragover', e => {
+  if (dragIndex === null) return;
+  const list = dropList(e.target);
+  if (!list) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  clearDropMarks();
+  const target = dropTarget(e, list);
+  if (target) target.row.classList.add(target.before ? 'drop-before' : 'drop-after');
+  else list.classList.add('over');
+});
+arrangeBody.addEventListener('drop', e => {
+  if (dragIndex === null) return;
+  const list = dropList(e.target);
+  if (!list) return;
+  e.preventDefault();
+  const section = list.dataset.section;
+  const target = dropTarget(e, list);
+  const index = dragIndex;
+  dragIndex = null;
+  clearDropMarks();
+  const others = sectionItems(section).filter(x => x.i !== index);
+  let position = others.length;
+  if (target) {
+    const targetIndex = parseInt(target.row.dataset.index, 10);
+    if (targetIndex === index) return;  // кинули на самого себе
+    const k = others.findIndex(x => x.i === targetIndex);
+    if (k >= 0) position = target.before ? k : k + 1;
+  }
+  arrangeMove(index, section, position);
+});
+
+// Кнопка верхнього розділу, у якого є підрозділи, відкриває список "куди додати картку":
+// сам розділ або будь-який вкладений підрозділ. Без підрозділів — звичайна кнопка.
+const sectionMenu = document.createElement('div');
+sectionMenu.className = 'sec-menu';
+sectionMenu.hidden = true;
+document.body.appendChild(sectionMenu);
+function closeSectionMenu() { sectionMenu.hidden = true; }
+document.addEventListener('mousedown', e => {
+  if (!sectionMenu.hidden && !sectionMenu.contains(e.target) && !e.target.closest('.section-btn')) closeSectionMenu();
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSectionMenu(); });
+window.addEventListener('resize', closeSectionMenu);
+
+function openSectionMenu(btn, index, top, wrap) {
+  sectionMenu.textContent = '';
+  const current = resultsData[index] ? resultsData[index].section : null;
+  sectionBranch(top).forEach(id => {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'sec-menu-item' + (id === current ? ' current' : '');
+    item.style.paddingLeft = (12 + (sectionDepth(id) - 1) * 16) + 'px';
+    item.textContent = id + ' · ' + (sectionTitles[id] || '');
+    item.addEventListener('click', () => { closeSectionMenu(); selectResultSection(index, id, wrap); });
+    sectionMenu.appendChild(item);
+  });
+  sectionMenu.hidden = false;
+  const r = btn.getBoundingClientRect();
+  const w = sectionMenu.offsetWidth, h = sectionMenu.offsetHeight;
+  sectionMenu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8)) + 'px';
+  sectionMenu.style.top = (r.bottom + 4 + h > window.innerHeight ? Math.max(8, r.top - h - 4) : r.bottom + 4) + 'px';
+}
+
+function fillSectionButtons(wrap, index, selected) {
+  wrap.textContent = '';
+  topSections().forEach(top => {
+    const hasKids = sectionChildren(top).length > 0;
+    const inBranch = selected === top || (!!selected && selected.startsWith(top + '.'));
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'section-btn' + (inBranch ? ' active' : '');
+    btn.textContent = inBranch && selected !== top ? selected : top + ' розділ';
+    if (hasKids) btn.appendChild(icon('chevron-down'));
+    btn.title = inBranch && selected !== top ? selected + ' ' + sectionTitles[selected] : '';
+    btn.addEventListener('click', () => {
+      if (hasKids) openSectionMenu(btn, index, top, wrap);
+      else selectResultSection(index, top, wrap);
+    });
+    wrap.appendChild(btn);
+  });
+}
+
 function makeSectionButtons(index, selected) {
   const wrap = document.createElement('div');
   wrap.className = 'r-sections';
-  for (let s = 1; s <= 6; s++) {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'section-btn' + (selected === s ? ' active' : '');
-    btn.textContent = s + ' розділ';
-    btn.addEventListener('click', () => selectResultSection(index, s, wrap));
-    wrap.appendChild(btn);
-  }
+  fillSectionButtons(wrap, index, selected);
   return wrap;
 }
 
+// Після зміни дерева розділів перебудовує кнопки на всіх картках.
+function rebuildCardSections() {
+  resultsList.querySelectorAll('.result-item').forEach(card => {
+    const i = parseInt(card.dataset.index, 10);
+    const wrap = card.querySelector('.r-sections');
+    if (wrap && resultsData[i]) fillSectionButtons(wrap, i, resultsData[i].section);
+  });
+}
+
+// Підтягує з сервера актуальні розділи карток (напр. після видалення підрозділу).
+async function syncResultsFromServer() {
+  if (!currentJobGen) return;
+  try {
+    const data = await (await fetch('/api/log/' + currentJobGen)).json();
+    (data.results || []).forEach((r, i) => { resultsData[i] = resultFields(r); });
+    rebuildCardSections();
+    updateNewInfo();
+    renderArrange();
+  } catch (e) { /* наступний poll синхронізує */ }
+}
+
 async function selectResultSection(index, section, wrapEl) {
-  wrapEl.querySelectorAll('.section-btn').forEach((b, i) => b.classList.toggle('active', i + 1 === section));
+  if (resultsData[index]) {
+    if (resultsData[index].section !== section) delete resultsData[index].rank;
+    resultsData[index].section = section;
+  }
+  fillSectionButtons(wrapEl, index, section);
+  updateNewInfo();
+  renderArrange();
   try {
     await fetch('/api/generate/select', {
       method: 'POST',
@@ -2088,10 +2878,31 @@ async function selectResultSection(index, section, wrapEl) {
   } catch (e) { /* наступний poll підтвердить/синхронізує стан */ }
 }
 
+let resultsData = [];  // копія результатів: назва, рядок, розділ, місце в розділі (rank)
+
+function resultFields(r) {
+  return { filename: r.filename, line: r.line, section: r.section, rank: r.rank, locked: !!r.locked, source: r.source };
+}
+
 function appendResultItem(item, index) {
   const div = document.createElement('div');
   div.className = 'result-item';
+  div.dataset.index = String(index);
 
+  // Пункт із порядку денного: компактна картка в згорнутій групі, розділ уже обрано й змінити його не можна.
+  if (item.locked) {
+    div.classList.add('is-agenda');
+    const sec = document.createElement('span');
+    sec.className = 'a-sec';
+    sec.textContent = item.section;
+    div.append(sec, document.createTextNode((item.line || '').trim()));
+    agendaList.appendChild(div);
+    agendaCards.style.display = 'block';
+    agendaCount.textContent = String(agendaList.children.length);
+    return;
+  }
+
+  if (agendaActive) div.classList.add('is-new');
   const fileEl = document.createElement('div');
   fileEl.className = 'r-file';
   const indexEl = document.createElement('span');
@@ -2099,6 +2910,12 @@ function appendResultItem(item, index) {
   indexEl.textContent = String(index + 1);
   fileEl.appendChild(indexEl);
   fileEl.appendChild(document.createTextNode(item.filename));
+  if (agendaActive) {
+    const badge = document.createElement('span');
+    badge.className = 'new-badge';
+    badge.textContent = 'Новий';
+    fileEl.appendChild(badge);
+  }
   div.appendChild(fileEl);
 
   const textEl = document.createElement('div');
@@ -2110,14 +2927,27 @@ function appendResultItem(item, index) {
   resultsList.appendChild(div);
 }
 
+// Скільки нових пунктів і для скількох ще не обрано розділ.
+function updateNewInfo() {
+  const fresh = resultsData.filter(r => !r.locked);
+  const todo = fresh.filter(r => r.section == null).length;
+  newInfo.textContent = agendaActive && fresh.length
+    ? 'Нові пункти з файлів: ' + fresh.length + (todo ? ' · обрати розділ ще треба для: ' + todo : ' · розділи обрано для всіх')
+    : '';
+}
+
 function renderResults(results) {
   if (!results || !results.length) return;
   resultsLayout.style.display = 'flex';
   generateBtn.style.display = 'flex';
+  newBatchBtn.style.display = 'block';
   for (let i = renderedResultsCount; i < results.length; i++) {
+    resultsData[i] = resultFields(results[i]);
     appendResultItem(results[i], i);
   }
   renderedResultsCount = results.length;
+  updateNewInfo();
+  renderArrange();
 }
 
 generateBtn.addEventListener('click', async () => {
@@ -2156,13 +2986,170 @@ generateBtn.addEventListener('click', async () => {
   }
 });
 
+// Зауваження до назв файлів — той самий вигляд, що й зауваження до порядку денного,
+// але замість посилання — нова назва файлу; "Перейменувати" перейменовує файл у програмі.
+function renderAuditGen(items) {
+  auditItemsGen = items || [];
+  if (!auditItemsGen.length) {
+    auditSignatureGen = '';
+    auditListGen.textContent = '';
+    auditDetailsGen.style.display = 'none';
+    return;
+  }
+  auditDetailsGen.style.display = 'block';
+  const signature = auditItemsGen.map(i => i.id).join('|');
+  if (signature !== auditSignatureGen) {
+    auditSignatureGen = signature;
+    auditListGen.textContent = '';
+    auditItemsGen.forEach(i => auditListGen.appendChild(auditRowGen(i)));
+  }
+  updateAuditTitleGen();
+}
+
+function updateAuditTitleGen() {
+  const done = auditItemsGen.filter(i => skippedGen.has(i.id)).length;
+  auditTitleGen.textContent = 'Назви файлів: пропущено ' + done + ' з ' + auditItemsGen.length;
+}
+
+function auditRowGen(i) {
+  const row = document.createElement('div');
+  row.className = 'audit-item';
+  row.dataset.id = i.id;
+
+  const head = document.createElement('label');
+  head.className = 'a-head';
+  head.title = 'Позначте, щоб пропустити цей файл';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.checked = skippedGen.has(i.id);
+  row.classList.toggle('fixed', cb.checked);
+  cb.addEventListener('change', () => {
+    if (cb.checked) skippedGen.add(i.id); else skippedGen.delete(i.id);
+    row.classList.toggle('fixed', cb.checked);
+    updateAuditTitleGen();
+    checkAllResolvedGen();
+  });
+  const text = document.createElement('span');
+  text.innerHTML = '<span class="a-kind">' + escapeHtml(i.kind) + '</span>' +
+    '<span class="a-where">' + escapeHtml('файл «' + i.filename + '»') + '</span>' +
+    '<span class="a-text">' + escapeHtml(i.text) + '</span>';
+  head.append(cb, text);
+  row.appendChild(head);
+
+  const form = document.createElement('div');
+  form.className = 'a-fix';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.placeholder = 'Нова назва, напр. 183-25.pdf';
+  input.value = draftsGen.has(i.id) ? draftsGen.get(i.id) : (i.suggest || i.filename);
+  input.addEventListener('input', () => draftsGen.set(i.id, input.value));
+  const save = document.createElement('button');
+  save.type = 'button';
+  save.textContent = 'Перейменувати';
+  form.append(input, save);
+  const msg = document.createElement('div');
+  msg.className = 'a-msg';
+  if (i.suggest) msg.textContent = 'Підказка: ' + i.suggest;
+  row.append(form, msg);
+
+  const submit = async () => {
+    save.disabled = true;
+    msg.className = 'a-msg';
+    msg.textContent = 'Перейменовуємо…';
+    try {
+      const resp = await fetch('/api/generate/rename', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_id: currentJobGen, audit_id: i.id, new_name: input.value }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.error || ('Помилка ' + resp.status));
+      draftsGen.delete(i.id);
+      skippedGen.delete(i.id);
+      showToast('Файл перейменовано: ' + i.filename + ' → ' + data.new_name, 'ok');
+      const log = await (await fetch('/api/log/' + currentJobGen)).json();
+      renderLogGen(log.log);
+      renderAuditGen(data.audit);
+      checkAllResolvedGen();
+    } catch (e) {
+      save.disabled = false;
+      msg.className = 'a-msg err';
+      msg.textContent = e.message;
+    }
+  };
+  save.addEventListener('click', submit);
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+  return row;
+}
+
+// Усі назви виправлені (зникли зі списку) або пропущені галочкою — сервер перевіряє їх
+// ще раз і, якщо все гаразд, починає обробку.
+async function checkAllResolvedGen() {
+  if (!awaitingGen || proceedingGen) return;
+  if (auditItemsGen.some(i => !skippedGen.has(i.id))) return;
+  proceedingGen = true;
+  setRunningGen(true);
+  statusTextGen.textContent = 'Усі назви опрацьовано — перевіряємо ще раз…';
+  let data;
+  try {
+    const resp = await fetch('/api/generate/proceed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_id: currentJobGen, acknowledged: [...skippedGen] }),
+    });
+    data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || ('Помилка ' + resp.status));
+  } catch (e) {
+    statusTextGen.textContent = 'Помилка: ' + e.message;
+    setRunningGen(false);
+    proceedingGen = false;
+    return;
+  }
+  if (data.started) {
+    const jobId = data.job_id;
+    resetRunUiGen('Назви перевірено, починаємо обробку…', true);
+    currentJobGen = jobId;
+    pollGen();
+    return;
+  }
+  setRunningGen(false);
+  proceedingGen = false;
+  statusTextGen.textContent = 'Після повторної перевірки лишилися некоректні назви — виправте їх або позначте галочкою.';
+  const log = await (await fetch('/api/log/' + currentJobGen)).json();
+  renderLogGen(log.log);
+  renderAuditGen(data.audit);
+}
+
 function pollGen() {
   pollTimerGen = setInterval(async () => {
     const resp = await fetch('/api/log/' + currentJobGen);
     const data = await resp.json();
     renderLogGen(data.log);
     updateProgressGen(data.log);
+    if (data.failed) {
+      clearInterval(pollTimerGen);
+      setRunningGen(false);
+      statusPctGen.textContent = '';
+      statusTextGen.textContent = 'Не вдалося прочитати порядок денний — причина в журналі.';
+      logDetailsGen.open = true;
+      return;
+    }
+    if (data.agenda && data.sections && !agendaActive) {  // розділи завдання — заголовки з порядку денного
+      agendaActive = true;
+      applySections(data.sections);
+    }
     renderResults(data.results);
+    renderAuditGen(data.audit);
+    if (data.done && data.awaiting) {
+      clearInterval(pollTimerGen);
+      setRunningGen(false);
+      awaitingGen = true;
+      statusPctGen.textContent = '';
+      statusTextGen.textContent = 'Обробку не розпочато: у назвах файлів є помилки (' + data.audit.length +
+        '). Перейменуйте файли або позначте їх галочкою, щоб пропустити — назви буде перевірено ще раз, і обробка почнеться сама.';
+      checkAllResolvedGen();
+      return;
+    }
     if (data.done) {
       clearInterval(pollTimerGen);
       setRunningGen(false);
@@ -2212,6 +3199,46 @@ def agenda_title(filename: str) -> str:
     return f"{stem} ({datetime.now().year})"
 
 
+def get_work_dir() -> Path:
+    """Робоча папка: куди скачуються файли і звідки дерево їх читає. Обирає користувач."""
+    saved = _read_json(SETTINGS_PATH, {}).get("work_dir")
+    return Path(saved).expanduser() if saved else DEFAULT_OUT_DIR
+
+
+def save_work_dir(folder: Path):
+    cfg = _read_json(SETTINGS_PATH, {})
+    cfg["work_dir"] = str(folder)
+    _write_json(SETTINGS_PATH, cfg)
+
+
+def validate_work_dir(raw: str) -> Path:
+    """Шлях від користувача -> готова до роботи папка (створюється, якщо її ще немає)."""
+    raw = (raw or "").strip().strip('"')
+    if not raw:
+        raise ValueError("Вкажіть шлях до папки.")
+    folder = Path(raw).expanduser()
+    if not folder.is_absolute():
+        raise ValueError("Вкажіть повний шлях до папки, напр. C:\\Users\\Ім’я\\Documents\\Порядок.")
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ValueError(f"Не вдалося створити папку: {exc}") from exc
+    if not folder.is_dir():
+        raise ValueError("Цей шлях — не папка.")
+    if not os.access(folder, os.W_OK):
+        raise ValueError("У цю папку не можна записувати — оберіть іншу.")
+    return folder
+
+
+def detect_agenda(folder: Path) -> str:
+    """Назва порядку денного для папки, яку користувач обрав як робочу: найновіший PDF
+    у корені, що не схожий на скачаний пункт; інакше — назва самої папки."""
+    pdfs = [p for p in folder.glob("*.pdf") if p.is_file() and not core.MAIN_FILENAME_RE.match(p.name)]
+    if pdfs:
+        return agenda_title(max(pdfs, key=lambda p: p.stat().st_mtime).name)
+    return folder.name or str(folder)
+
+
 def _natural_key(name: str):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
 
@@ -2251,15 +3278,58 @@ def open_in_os(path: str):
         subprocess.run(["xdg-open", path])
 
 
-def reveal_in_os(path: Path):
-    """Показує файл/папку в провіднику (з виділенням), а не відкриває її вміст."""
+def _reveal_windows_api(path) -> bool:
+    """Відкриває Провідник із виділеним елементом системним викликом SHOpenFolderAndSelectItems —
+    без командного рядка, тож пробіли, кирилиця й лапки в шляху нічого не ламають."""
+    import ctypes
+    from ctypes import wintypes
+    shell32, ole32 = ctypes.windll.shell32, ctypes.windll.ole32
+    shell32.SHParseDisplayName.argtypes = [wintypes.LPCWSTR, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+                                           wintypes.ULONG, ctypes.POINTER(wintypes.ULONG)]
+    shell32.SHParseDisplayName.restype = ctypes.c_long
+    shell32.SHOpenFolderAndSelectItems.argtypes = [ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p, wintypes.DWORD]
+    shell32.SHOpenFolderAndSelectItems.restype = ctypes.c_long
+    ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    initialized = ole32.CoInitialize(None) in (0, 1)  # запит Flask іде у власному потоці
+    pidl = ctypes.c_void_p()
+    try:
+        if shell32.SHParseDisplayName(str(path), None, ctypes.byref(pidl), 0, None) != 0:
+            return False
+        try:
+            return shell32.SHOpenFolderAndSelectItems(pidl, 0, None, 0) == 0  # 0 елементів = виділити сам шлях
+        finally:
+            ole32.CoTaskMemFree(pidl)
+    finally:
+        if initialized:
+            ole32.CoUninitialize()
+
+
+def reveal_in_os(path: Path) -> str:
+    """Показує файл/папку в провіднику (з виділенням), а не відкриває її вміст. Повертає, який спосіб
+    спрацював (його видно в консолі). Якщо не спрацював жоден — OSError."""
     system = platform.system()
+    text = os.path.normpath(str(path))  # на Windows — зворотні скісні риски, як того вимагає Провідник
     if system == "Windows":
-        subprocess.Popen(["explorer", f"/select,{path}"])
-    elif system == "Darwin":
-        subprocess.run(["open", "-R", str(path)])
-    else:
-        subprocess.run(["xdg-open", str(path.parent)])
+        attempts = []
+        # 1) системний виклик; 2) команда з лапками лише навколо шляху (якщо передати списком, subprocess
+        # візьме в лапки весь "/select,<шлях>" — Explorer його не розбере й відкриє "Документи");
+        # 3) хоча б відкрити папку, де лежить елемент.
+        attempts.append(("SHOpenFolderAndSelectItems", lambda: _reveal_windows_api(text)))
+        attempts.append(("explorer /select", lambda: subprocess.Popen(f'explorer /select,"{text}"') is not None))
+        attempts.append(("відкрито папку", lambda: os.startfile(str(path.parent)) is None))  # type: ignore[attr-defined]
+        for name, attempt in attempts:
+            try:
+                if attempt():
+                    print(f"[показати місце] {text} -> {name}", flush=True)
+                    return name
+            except Exception as exc:
+                print(f"[показати місце] {name}: не вдалося ({exc})", flush=True)
+        raise OSError(f"Провідник не відкрив {text}")
+    if system == "Darwin":
+        subprocess.run(["open", "-R", str(path)], check=True)
+        return "open -R"
+    subprocess.run(["xdg-open", str(path.parent)], check=True)
+    return "xdg-open"
 
 
 CONTACTS_PATH = BASE_DIR / "contacts.json"
@@ -2512,6 +3582,7 @@ def audit_entries(problems) -> list:
         seen[key] = seen.get(key, 0) + 1
         entries.append({
             "id": f"{key}|{seen[key]}", "kind": kind, "section": section, "item": item, "text": text,
+            "pr": (extra or {}).get("pr"),
             "fix": kind in FIXABLE_AUDIT_KINDS and extra is not None, "extra": extra,
         })
     return entries
@@ -2594,16 +3665,88 @@ def extract_speaker_short_name(pdf_path: Path) -> str | None:
                     if match:
                         surname, first_name, patronymic = match.groups()
                         return f"{surname} {first_name[0]}.{patronymic[0]}."
+                for pattern in SPEAKER_NAME_FIRST_PATTERNS:
+                    match = pattern.search(result.stdout)
+                    if match:
+                        first_name, surname = match.groups()
+                        return f"{_surname_case(surname)} {first_name[0]}."
     finally:
         doc.close()
     return None
 
 
-def run_generate_job(job_id: str, file_paths: list):
+def load_agenda_into_job(job: dict):
+    """Читає порядок денний: його заголовки стають деревом розділів завдання, а пункти — готовими
+    (заблокованими) картками з уже обраними розділами та порядком."""
+    info = job["agenda"]
+    model = agenda_doc.load_agenda(info["path"])
+    items, headings = model.items(), model.sections()
+    if not items:
+        raise ValueError("не знайдено жодного пункту виду «1) Про …».")
+    position, loaded = collections.Counter(), []
+    for item in items:
+        sid = item["section"]
+        if sid not in headings:  # пункт до першого заголовка розділу
+            continue
+        loaded.append({"filename": info["name"], "line": item["text"], "url": item["url"], "section": sid,
+                       "rank": position[sid], "source": "agenda", "locked": True, "agenda_index": item["index"]})
+        position[sid] += 1
+    titles = {sid: headings[sid].rstrip(": ").strip() for sid in sorted(headings, key=section_key)}
+    job["results"][:0] = loaded
+    job["sections"] = {"titles": titles, "locked": list(titles)}
+    info["parsed"] = True
+    job["log"].append(f"Порядок денний «{info['name']}»: розділів — {len(titles)}, пунктів — {len(loaded)}. "
+                      "Нові пункти буде додано в нього на обрані вами місця.")
+
+
+def build_agenda_doc(job: dict) -> Path:
+    """Порядок денний + нові пункти: Word-файл правиться на місці (форматування й посилання старих
+    пунктів не чіпаються), з PDF відновлюється Word-документ. Нові пункти стають там, де їх розставив
+    користувач; нумерація "N)" у зачеплених розділах перераховується."""
+    info, results, titles = job["agenda"], job["results"], job["sections"]["titles"]
+    model = agenda_doc.load_agenda(info["path"])
+    placements = {}
+    for sid in titles:
+        entries = []
+        for r in section_order(results, sid):
+            entries.append(("agenda", r["agenda_index"]) if r.get("locked") else ("new", r["line"].strip(), r["url"]))
+        placements[sid] = entries
+    agenda_doc.apply_new_items(model, placements, titles)
+    out = BASE_DIR / (core.sanitize_filename(Path(info["name"]).stem) + " (з новими пунктами).docx")
+    model.save(out)
+    return out
+
+
+def run_generate_job(job_id: str, file_paths: list, skip=frozenset()):
+    """Спершу перевіряє назви файлів: поки є некоректні (крім тих, що користувач пропустив),
+    обробка не починається — файли можна перейменувати в програмі (awaiting_fixes)."""
     job = jobs[job_id]
 
     def log(msg):
         job["log"].append(str(msg))
+
+    if job.get("agenda") and not job["agenda"].get("parsed"):
+        try:
+            load_agenda_into_job(job)
+        except Exception as exc:
+            log(f"[!] Не вдалося прочитати порядок денний: {exc}")
+            job["failed"] = True
+            job["done"] = True
+            return
+
+    entries = generate_name_entries(file_paths)
+    pending = [e for e in entries if e["filename"] not in skip]
+    if pending:
+        job["audit"] = entries
+        job["awaiting_fixes"] = True
+        log(f"Перевірка назв файлів: некоректних — {len(pending)} з {len(file_paths)}. Обробку не розпочато: "
+            "перейменуйте файли або позначте їх галочкою, щоб пропустити — після цього назви буде перевірено "
+            "ще раз і обробка почнеться.")
+        job["done"] = True
+        return
+    for path in [p for p in file_paths if p.name in skip]:
+        log(f"    [i] {path.name}: пропущено за вашим рішенням (некоректна назва файлу)")
+    file_paths = [p for p in file_paths if p.name not in skip]
 
     log(f"Знайдено файлів для обробки: {len(file_paths)}")
 
@@ -2614,55 +3757,39 @@ def run_generate_job(job_id: str, file_paths: list):
         ok, failed = 0, []
         for file_path in file_paths:
             filename = file_path.name
-            match = DECISION_NUMBER_RE.match(filename)
-            if not match:
-                log(f"[!] {filename}: не вдалося визначити номер з назви файлу "
-                    f"(очікується формат NNN-XX.pdf)")
+            number, year, name_error = check_decision_filename(filename)
+            if name_error:  # мало б бути відсіяно перевіркою вище
+                log(f"[!] {filename}: {name_error} (очікується формат НОМЕР-РІК.pdf, напр. 183-25.pdf)")
                 failed.append(filename)
                 continue
-
-            number = match.group(1)
-            url = SEARCH_URL_TEMPLATE.format(number=number)
+            label = f"номер {number}" + (f", {year} рік" if year else "")
             try:
-                resp = session.get(url, timeout=20)
-                resp.raise_for_status()
+                project_url, project_html, note = find_project_page(session, number, year)
+            except LookupError as exc:
+                log(f"[!] {filename} ({label}): {exc}")
+                failed.append(filename)
+                continue
             except Exception as exc:
-                log(f"[!] {filename} (номер {number}): помилка запиту до пошуку — {exc}")
+                log(f"[!] {filename} ({label}): помилка запиту до пошуку чи сторінки проєкту — {exc}")
                 failed.append(filename)
                 continue
+            if note:
+                log(f"    [i] {filename}: {note}")
 
-            link_match = SEARCH_RESULT_LINK_RE.search(resp.text)
-            if not link_match:
-                log(f"[!] {filename} (номер {number}): у результатах пошуку не знайдено "
-                    f"жодного посилання на проєкт рішення")
-                failed.append(filename)
-                continue
-
-            href, project_id = link_match.group(1), link_match.group(2)
-            project_url = SEARCH_RESULT_BASE_URL + href
-
-            try:
-                project_resp = session.get(project_url, timeout=20)
-                project_resp.raise_for_status()
-            except Exception as exc:
-                log(f"[!] {filename} (номер {number}): помилка запиту до сторінки проєкту — {exc}")
-                failed.append(filename)
-                continue
-
-            title = extract_project_title(project_resp.text)
-            date = extract_project_date(project_resp.text)
+            title = extract_project_title(project_html)
+            date = extract_project_date(project_html)
             if not title or not date:
                 missing = ", ".join(
                     n for n, v in (("заголовок", title), ("дата реєстрації", date)) if not v
                 )
-                log(f"[!] {filename} (номер {number}): не вдалося знайти на сторінці проєкту: {missing} — {project_url}")
+                log(f"[!] {filename} ({label}): не вдалося знайти на сторінці проєкту: {missing} — {project_url}")
                 failed.append(filename)
                 continue
 
             try:
                 short_name = extract_speaker_short_name(file_path)
             except Exception as exc:
-                log(f"[!] {filename} (номер {number}): помилка розпізнавання доповідача — {exc}")
+                log(f"[!] {filename} ({label}): помилка розпізнавання доповідача — {exc}")
                 failed.append(filename)
                 continue
             if not short_name:
@@ -2676,7 +3803,7 @@ def run_generate_job(job_id: str, file_paths: list):
             )
             log(f"[+] {filename} -> {line}")
             job["results"].append({
-                "filename": filename, "line": line, "section": None, "url": project_url,
+                "filename": filename, "line": line, "section": None, "url": project_url, "source": "new",
             })
             ok += 1
 
@@ -2711,28 +3838,31 @@ def add_hyperlink(paragraph, url: str, text: str):
     return hyperlink
 
 
+def section_order(results: list, section: int) -> list:
+    """Пункти розділу в порядку документа: спершу ті, що користувач розставив (rank), потім
+    решта — у порядку завантаження."""
+    items = [(i, r) for i, r in enumerate(results) if r.get("section") == section]
+    items.sort(key=lambda t: (t[1].get("rank", 10**9), t[0]))
+    return [r for _, r in items]
+
+
 def build_generated_doc(results: list) -> Path:
     """Будує "Згенерованний ПР.docx" у папці даних застосунку (BASE_DIR): 6 розділів з
     підказки, у кожному — обрані користувачем пункти, де сам текст пункту —
     гіперлінк на сторінку проєкту рішення. Нумерація пунктів у кожному
     розділі завжди починається з 1) (без префіксу номера розділу)."""
-    by_section = {n: [] for n in range(1, 7)}
-    for item in results:
-        section = item.get("section")
-        if section in by_section:
-            by_section[section].append(item)
-
     doc = Document()
     style = doc.styles["Normal"]
     style.font.name = "Times New Roman"
     style.font.size = Pt(12)
 
-    for section_num in range(1, 7):
+    # Розділ, його власні пункти, далі підрозділи (у порядку номерів) — і так до 4-го рівня.
+    for section_id in section_ids():
         header = doc.add_paragraph()
-        header_run = header.add_run(f"{section_num}) {SECTION_TITLES[section_num]}:")
+        header_run = header.add_run(f"{section_id}) {SECTION_TITLES[section_id]}:")
         header_run.bold = True
 
-        for sub_index, item in enumerate(by_section[section_num], start=1):
+        for sub_index, item in enumerate(section_order(results, section_id), start=1):
             title = item["line"].lstrip("\t")
             para = doc.add_paragraph()
             para.paragraph_format.left_indent = Inches(0.4)
@@ -2745,27 +3875,95 @@ def build_generated_doc(results: list) -> Path:
 
 @app.route("/")
 def index():
-    return render_template_string(PAGE, default_out_dir=str(DEFAULT_OUT_DIR), icon_sprite=icon_sprite())
+    return render_template_string(PAGE, default_out_dir=str(get_work_dir()), icon_sprite=icon_sprite())
+
+
+def sections_payload(titles: dict, locked=()) -> dict:
+    """locked — заголовки з порядку денного: їх не перейменовують і не видаляють."""
+    return {"sections": dict(titles), "order": section_ids(titles), "locked": sorted(locked, key=section_key)}
+
+
+def tree_for(job_id):
+    """Дерево розділів: якщо в завданні є порядок денний — його власні заголовки (і підрозділи, додані
+    поверх них), інакше загальне, збережене на диску. Повертає (назви, заблоковані id, завдання)."""
+    job = jobs.get(job_id) if job_id else None
+    if job and job.get("sections"):
+        return job["sections"]["titles"], set(job["sections"]["locked"]), job
+    return SECTION_TITLES, set(), None
 
 
 @app.route("/api/sections")
 def api_sections_get():
-    return jsonify(sections={str(n): SECTION_TITLES[n] for n in range(1, 7)})
+    titles, locked, _ = tree_for(request.args.get("job_id"))
+    return jsonify(**sections_payload(titles, locked))
 
 
 @app.route("/api/sections", methods=["POST"])
 def api_sections_set():
     data = request.get_json(silent=True) or {}
-    section = data.get("section")
+    titles, locked, job = tree_for(data.get("job_id"))
+    section = str(data.get("section", ""))
     title = (data.get("title") or "").strip()
-    if section not in range(1, 7):
+    if section not in titles:
         return jsonify(error="invalid section"), 400
+    if section in locked:
+        return jsonify(error="Заголовок із порядку денного змінювати не можна."), 400
     if not title:
         return jsonify(error="Назва розділу не може бути порожньою"), 400
 
-    SECTION_TITLES[section] = title
-    save_section_titles(SECTION_TITLES)
-    return jsonify(ok=True, sections={str(n): SECTION_TITLES[n] for n in range(1, 7)})
+    titles[section] = title
+    if job is None:
+        save_section_titles(SECTION_TITLES)
+    return jsonify(ok=True, **sections_payload(titles, locked))
+
+
+@app.route("/api/sections/add", methods=["POST"])
+def api_sections_add():
+    """Додає підрозділ до розділу: 1 -> 1.1, 1.1 -> 1.1.1 … (до 4 рівнів)."""
+    data = request.get_json(silent=True) or {}
+    titles, locked, job = tree_for(data.get("job_id"))
+    parent = str(data.get("parent", ""))
+    if parent not in titles:
+        return jsonify(error="invalid section"), 400
+    if section_depth(parent) >= MAX_SECTION_DEPTH:
+        return jsonify(error=f"Глибше за {MAX_SECTION_DEPTH} рівні підрозділи створювати не можна."), 400
+    siblings = [int(k.rsplit(".", 1)[1]) for k in titles
+                if k.startswith(parent + ".") and section_depth(k) == section_depth(parent) + 1]
+    new_id = f"{parent}.{max(siblings, default=0) + 1}"
+    titles[new_id] = NEW_SUBSECTION_TITLE
+    if job is None:
+        save_section_titles(SECTION_TITLES)
+    return jsonify(ok=True, id=new_id, **sections_payload(titles, locked))
+
+
+@app.route("/api/sections/delete", methods=["POST"])
+def api_sections_delete():
+    """Видаляє підрозділ разом із вкладеними. Картки з них повертаються в батьківський розділ,
+    номери наступних підрозділів зсуваються (1.3 -> 1.2), а розділи в списках результатів
+    оновлюються відповідно. Заголовки з порядку денного й основні розділи 1–6 видаляти не можна."""
+    data = request.get_json(silent=True) or {}
+    titles, locked, job = tree_for(data.get("job_id"))
+    section = str(data.get("section", ""))
+    if section not in titles:
+        return jsonify(error="invalid section"), 400
+    if section in locked:
+        return jsonify(error="Заголовок із порядку денного видаляти не можна."), 400
+    if section_depth(section) == 1:
+        return jsonify(error="Основні розділи 1–6 видаляти не можна."), 400
+    new_titles, mapping, removed = plan_section_delete(titles, section)
+    titles.clear()
+    titles.update(new_titles)
+    if job is None:
+        save_section_titles(SECTION_TITLES)
+    targets = [job] if job is not None else [j for j in list(jobs.values()) if not j.get("sections")]
+    for target in targets:
+        for result in target.get("results", []):
+            current = result.get("section")
+            if current in mapping:
+                result["section"] = mapping[current]
+                if current in removed:
+                    result.pop("rank", None)  # у батьківському розділі — в кінець
+    return jsonify(ok=True, **sections_payload(titles, locked))
 
 
 @app.route("/upload", methods=["POST"])
@@ -2774,11 +3972,13 @@ def upload():
     if not uploaded or not uploaded.filename:
         return jsonify(error="Файл не обрано"), 400
 
-    out_dir_raw = request.form.get("out_dir", "").strip()
-    out_dir = Path(out_dir_raw).expanduser() if out_dir_raw else DEFAULT_OUT_DIR
+    try:
+        out_dir = validate_work_dir(request.form.get("out_dir", "").strip() or str(get_work_dir()))
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    save_work_dir(out_dir)  # що використали — те й запам'ятали
 
     # Сам файл порядку денного лежить у корені папки результатів — його видно в дереві.
-    out_dir.mkdir(parents=True, exist_ok=True)
     job_id = uuid.uuid4().hex
     pdf_path = out_dir / Path(uploaded.filename).name
 
@@ -2808,18 +4008,55 @@ def generate_upload():
     if not uploaded_files:
         return jsonify(error="Файли не обрано"), 400
 
+    # Файли можна додавати порціями (навіть по одному): нова порція дописується до вже
+    # оброблених результатів попередньої (prev_job), і з усіх них збирається один документ.
+    prev = jobs.get(request.form.get("prev_job", ""))
+    results = [dict(r) for r in prev.get("results", [])] if prev else []
+    already = {r["filename"] for r in results}
+    log, fresh = [], []
+    for uploaded in uploaded_files:
+        name = Path(uploaded.filename).name
+        if name in already:
+            log.append(f"    [i] {name}: уже оброблено раніше в цьому списку — пропущено")
+        else:
+            fresh.append((uploaded, name))
+    if not fresh:
+        return jsonify(error="Усі ці файли вже оброблено раніше."), 400
+
     job_id = uuid.uuid4().hex
     job_dir = GENERATE_UPLOADS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-
-    file_paths = []
-    for uploaded in uploaded_files:
-        dest = job_dir / Path(uploaded.filename).name
+    saved = []
+    for uploaded, name in fresh:
+        dest = job_dir / name
         uploaded.save(dest)
-        file_paths.append(dest)
-    file_paths.sort(key=lambda p: p.name)
+        saved.append(dest)
 
-    jobs[job_id] = {"log": [], "done": False, "out_dir": str(job_dir), "results": []}
+    # Порядок денний серед файлів: Word (.docx) або PDF з посиланнями на проєкти, назва якого не схожа
+    # на "НОМЕР-РІК". Він один; його пункти стають готовими картками, а нові вставляються в нього.
+    agendas = [p for p in saved if p.suffix.lower() == ".docx" or (
+        p.suffix.lower() == ".pdf" and check_decision_filename(p.name)[2] and agenda_doc.looks_like_agenda_pdf(p))]
+    error = None
+    if len(agendas) > 1:
+        error = "Можна додати лише один порядок денний за раз."
+    elif agendas and prev and prev.get("agenda"):
+        error = "Порядок денний уже завантажено. Щоб взяти інший, натисніть «Очистити список і почати заново»."
+    elif agendas and results:
+        error = ("Порядок денний додається разом із першими файлами. Натисніть «Очистити список і почати заново» "
+                 "й завантажте його разом з усіма файлами.")
+    if error:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return jsonify(error=error), 400
+    agenda_path = agendas[0] if agendas else None
+    file_paths = sorted((p for p in saved if p != agenda_path), key=lambda p: p.name)
+
+    job = {"log": log, "done": False, "out_dir": str(job_dir), "results": results}
+    if prev and prev.get("agenda"):  # порядок денний і його розділи переходять у наступні порції
+        job["agenda"], job["sections"] = prev["agenda"], prev["sections"]
+    if agenda_path:
+        job["agenda"] = {"path": str(agenda_path), "name": agenda_path.name, "kind": agenda_path.suffix.lower().lstrip("."),
+                         "parsed": False}
+    jobs[job_id] = job
     thread = threading.Thread(target=run_generate_job, args=(job_id, file_paths), daemon=True)
     thread.start()
 
@@ -2831,8 +4068,75 @@ def api_log(job_id):
     job = jobs.get(job_id)
     if not job:
         return jsonify(error="unknown job"), 404
+    extra = {}
+    if job.get("agenda"):
+        extra["agenda"] = {"name": job["agenda"]["name"], "kind": job["agenda"]["kind"],
+                           "items": sum(1 for r in job.get("results", []) if r.get("locked"))}
+        if job.get("sections"):
+            extra["sections"] = sections_payload(job["sections"]["titles"], job["sections"]["locked"])
     return jsonify(log=job["log"], done=job["done"], results=job.get("results", []), audit=job.get("audit", []),
-                   awaiting=job.get("awaiting_fixes", False))
+                   awaiting=job.get("awaiting_fixes", False), failed=job.get("failed", False), **extra)
+
+
+def _generate_job_files(folder: Path) -> list:
+    return sorted(p for p in folder.iterdir() if p.is_file())
+
+
+@app.route("/api/generate/rename", methods=["POST"])
+def api_generate_rename():
+    """Перейменовує файл (його копію в робочій папці програми — оригінал не чіпає) і
+    перевіряє назви ще раз."""
+    data = request.get_json(silent=True) or {}
+    job = jobs.get(data.get("job_id"))
+    if not job or not job.get("awaiting_fixes") or not job["done"] or job.get("proceeded"):
+        return jsonify(error="Немає чого перейменовувати — завантажте файли ще раз."), 400
+    entry = next((e for e in job["audit"] if e["id"] == data.get("audit_id")), None)
+    folder = Path(job["out_dir"])
+    if entry is None or not (folder / entry["filename"]).is_file():
+        return jsonify(error="Файл не знайдено — можливо, його вже видалили."), 400
+    try:
+        new_name = validate_new_filename(str(data.get("new_name", "")), folder, entry["filename"])
+        (folder / entry["filename"]).rename(folder / new_name)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except OSError as exc:
+        return jsonify(error=f"Не вдалося перейменувати файл: {exc}"), 400
+    job["audit"] = generate_name_entries(_generate_job_files(folder))
+    job["log"].append(f"[~] Файл перейменовано: {entry['filename']} → {new_name}")
+    return jsonify(ok=True, new_name=new_name, audit=job["audit"])
+
+
+@app.route("/api/generate/proceed", methods=["POST"])
+def api_generate_proceed():
+    """Усі зауваження до назв опрацьовано (перейменовано чи пропущено галочкою): назви
+    перевіряються ще раз, і якщо все гаразд — починається обробка."""
+    data = request.get_json(silent=True) or {}
+    old = jobs.get(data.get("job_id"))
+    if not old or not old.get("awaiting_fixes") or not old["done"]:
+        return jsonify(error="Немає чого продовжувати."), 400
+    if old.get("proceeded"):
+        return jsonify(error="Обробку вже розпочато."), 400
+    folder = Path(old["out_dir"])
+    files = _generate_job_files(folder)
+    entries = generate_name_entries(files)
+    acknowledged = {str(i)[len("name|"):] for i in data.get("acknowledged", []) if str(i).startswith("name|")}
+    pending = [e for e in entries if e["filename"] not in acknowledged]
+    old["audit"] = entries
+    if pending:
+        old["log"].append(f"[~] Повторна перевірка: некоректних назв лишилося — {len(pending)}. Обробку не розпочато.")
+        return jsonify(started=False, audit=entries)
+
+    old["proceeded"] = True
+    job_id = uuid.uuid4().hex
+    jobs[job_id] = {
+        "log": list(old["log"]) + ["Назви файлів перевірено — починаємо обробку."],
+        "done": False, "out_dir": str(folder), "results": [dict(r) for r in old.get("results", [])],
+    }
+    if old.get("agenda"):
+        jobs[job_id]["agenda"], jobs[job_id]["sections"] = old["agenda"], old.get("sections")
+    skip = frozenset(e["filename"] for e in entries)
+    threading.Thread(target=run_generate_job, args=(job_id, files, skip), daemon=True).start()
+    return jsonify(started=True, job_id=job_id)
 
 
 @app.route("/api/generate/select", methods=["POST"])
@@ -2847,11 +4151,43 @@ def api_generate_select():
     section = data.get("section")
     if not isinstance(index, int) or not (0 <= index < len(results)):
         return jsonify(error="invalid index"), 400
-    if section is not None and section not in range(1, 7):
+    if section is not None and section not in tree_for(data.get("job_id"))[0]:
         return jsonify(error="invalid section"), 400
+    if results[index].get("locked"):
+        return jsonify(error="Пункт із порядку денного: його розділ змінювати не можна."), 400
 
+    if results[index].get("section") != section:
+        results[index].pop("rank", None)  # у новому розділі — в кінець, поки користувач не переставить
     results[index]["section"] = section
     return jsonify(ok=True)
+
+
+@app.route("/api/generate/arrange", methods=["POST"])
+def api_generate_arrange():
+    """Ставить пункт на потрібне місце в розділі (можливо, переносячи з іншого розділу).
+    position — номер місця серед пунктів розділу БЕЗ самого пункту (0 — першим). Картки в
+    списку результатів не рухаються: порядок у розділі зберігається окремо (rank)."""
+    data = request.get_json(silent=True) or {}
+    job = jobs.get(data.get("job_id"))
+    if not job:
+        return jsonify(error="unknown job"), 404
+    if not job["done"]:
+        return jsonify(error="Зачекайте, поки завершиться обробка файлів."), 400
+    results = job.get("results", [])
+    index, section, position = data.get("index"), data.get("section"), data.get("position")
+    if (not isinstance(index, int) or not (0 <= index < len(results))
+            or section not in tree_for(data.get("job_id"))[0] or not isinstance(position, int) or position < 0):
+        return jsonify(error="invalid arrange"), 400
+    if results[index].get("locked"):
+        return jsonify(error="Пункти з порядку денного стоять на своїх місцях — переставляти можна лише нові."), 400
+
+    item = results[index]
+    others = [r for r in section_order(results, section) if r is not item]
+    others.insert(min(position, len(others)), item)
+    item["section"] = section
+    for rank, r in enumerate(others):
+        r["rank"] = rank
+    return jsonify(ok=True, results=results)
 
 
 @app.route("/api/generate/build", methods=["POST"])
@@ -2870,12 +4206,26 @@ def api_generate_build():
         return jsonify(error="not_all_selected", missing=missing), 400
 
     try:
-        doc_path = build_generated_doc(results)
+        doc_path = build_agenda_doc(job) if job.get("agenda") else build_generated_doc(results)
     except Exception as exc:
         return jsonify(error=f"Не вдалося створити документ: {exc}"), 500
 
     open_in_os(str(doc_path))
     return jsonify(ok=True, path=str(doc_path))
+
+
+@app.route("/api/settings", methods=["GET", "POST"])
+def api_settings():
+    """Робоча папка. Після зміни дерево показує вміст нової папки (зі своїм порядком денним)."""
+    if request.method == "POST":
+        try:
+            folder = validate_work_dir(str((request.get_json(silent=True) or {}).get("work_dir", "")))
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        save_work_dir(folder)
+        if current_agenda["out_dir"] != str(folder):
+            set_current_agenda(detect_agenda(folder), folder)
+    return jsonify(work_dir=str(get_work_dir()))
 
 
 @app.route("/api/tree")
@@ -2931,8 +4281,11 @@ def api_tree_reveal():
     target = _tree_target()
     if target is None:
         return jsonify(error="Файл або папку не знайдено — можливо, її видалили чи перемістили."), 400
-    reveal_in_os(target)
-    return jsonify(ok=True)
+    try:
+        reveal_in_os(target)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return jsonify(error=f"Не вдалося відкрити Провідник: {exc}. Шлях: {target}"), 400
+    return jsonify(ok=True, path=str(target))
 
 
 def _clean_contact(data: dict):
@@ -3143,10 +4496,10 @@ def api_audit_fix():
         if not isinstance(idx, int) or not (0 <= idx < len(extra["items"])):
             return jsonify(error="Оберіть пункт, у якому змінити посилання."), 400
         target = extra["items"][idx]
-        where = f"розділ {target['section']}, пункт {target['num']}"
+        where = f"розділ {target['section']}, пункт {target['num']}" + (f" · {target['pr']}" if target.get("pr") else "")
         pos = target["pos"]
     else:
-        where = f"розділ {entry['section']}, пункт {entry['item']}"
+        where = f"розділ {entry['section']}, пункт {entry['item']}" + (f" · {entry['pr']}" if entry.get("pr") else "")
         pos = extra["pos"]
 
     pdf_path = Path(job["pdf_path"])
@@ -3222,9 +4575,110 @@ def api_open(job_id):
     return jsonify(ok=True)
 
 
-def main():
-    """Запускає Flask на вільному порту і показує інтерфейс у власному вікні
-    (pywebview). Якщо pywebview недоступний — відкриває браузер."""
+class DesktopApi:
+    """Методи, які сторінка може викликати у вікні програми (window.pywebview.api)."""
+
+    def pick_folder(self, start=""):
+        import webview
+        kind = webview.FileDialog.FOLDER if hasattr(webview, "FileDialog") else webview.FOLDER_DIALOG
+        start_dir = start if start and Path(start).is_dir() else ""
+        chosen = webview.windows[0].create_file_dialog(kind, directory=start_dir)
+        return chosen[0] if chosen else None
+
+
+LOG_PATH = BASE_DIR / "app.log"
+
+
+def _setup_logging():
+    """У зібраному застосунку без консолі sys.stdout/stderr порожні, і помилки зникають безслідно —
+    тоді пишемо їх у app.log (у папці даних програми)."""
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    try:
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > 2 * 1024 * 1024:
+            LOG_PATH.unlink()
+        stream = open(LOG_PATH, "a", encoding="utf-8", buffering=1)
+    except OSError:
+        return
+    stream.write(f"\n=== {datetime.now():%Y-%m-%d %H:%M:%S} запуск ===\n")
+    if sys.stdout is None:
+        sys.stdout = stream
+    if sys.stderr is None:
+        sys.stderr = stream
+
+
+def _message_box(title: str, text: str, warning: bool = False):
+    """Вікно з повідомленням (Windows). Блокує, поки користувач не натисне OK."""
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(0, text, title, 0x30 if warning else 0x10)
+    except Exception:
+        pass
+
+
+def selftest(report_path: str) -> int:
+    """Перевірка зібраного застосунку без вікна: чи на місці бібліотеки та Tesseract і чи відповідає
+    сервер. Результат — у файл (без консолі іншого виводу немає); код виходу 0 — усе гаразд."""
+    lines = [f"Python {sys.version.split()[0]} {platform.architecture()[0]}, {platform.platform()}, зібрано: {FROZEN}"]
+    failed = []
+
+    def check(name, fn):
+        try:
+            lines.append(f"OK    {name}: {fn()}")
+        except Exception as exc:
+            failed.append(name)
+            lines.append(f"ЗБІЙ  {name}: {type(exc).__name__}: {exc}")
+
+    def tesseract():
+        cmd = find_tesseract_cmd()
+        if not cmd:
+            raise RuntimeError("не знайдено")
+        out = subprocess.run([cmd, "--list-langs"], capture_output=True, text=True, timeout=30,
+                             env=_tesseract_env(cmd), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if "ukr" not in out.stdout:
+            raise RuntimeError("немає мовних даних ukr: " + out.stdout.replace("\n", " ")[:80])
+        return cmd
+
+    def webview_ok():
+        import webview
+        if platform.system() == "Windows":
+            from webview.platforms import edgechromium  # noqa: F401  (потребує pythonnet / WebView2Loader)
+        return "імпортується"
+
+    def server():
+        client = app.test_client()
+        page = client.get("/")
+        if page.status_code != 200 or b"<title>" not in page.data:
+            raise RuntimeError(f"головна сторінка: HTTP {page.status_code}")
+        for url in ("/api/sections", "/api/tree", "/api/contacts", "/api/mail/settings"):
+            if client.get(url).status_code != 200:
+                raise RuntimeError(f"{url} відповів не 200")
+        return "сторінка й API відповідають"
+
+    def data_dir():
+        probe = BASE_DIR / ".selftest"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return str(BASE_DIR)
+
+    check("PyMuPDF", lambda: fitz.__doc__.split("\n")[0])
+    check("python-docx, openpyxl", lambda: (__import__("openpyxl").__version__, Document.__module__)[0])
+    check("pywebview", webview_ok)
+    check("Outlook (pywin32)", lambda: ("доступний" if outlook_available() else "недоступний") if platform.system() == "Windows" else "не Windows")
+    check("кошик (send2trash)", lambda: __import__("send2trash") and "імпортується")
+    check("Tesseract + ukr", tesseract)
+    check("сервер", server)
+    check("папка даних", data_dir)
+    lines.append("РЕЗУЛЬТАТ: " + ("усе гаразд" if not failed else "є збої: " + ", ".join(failed)))
+    Path(report_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return 1 if failed else 0
+
+
+def _run():
+    """Запускає Flask на вільному порту і показує інтерфейс у власному вікні (pywebview).
+    Якщо pywebview недоступний або вікно не відкрилося — відкриває браузер."""
     from werkzeug.serving import make_server
 
     server = make_server("127.0.0.1", 0, app, threaded=True)
@@ -3238,9 +4692,35 @@ def main():
         print(f"Відкрито в браузері: {url}  (Ctrl+C — вихід)")
         threading.Event().wait()
     else:
-        webview.create_window("Порядок денний", url, width=1200, height=850)
-        webview.start()
+        try:
+            webview.create_window("Порядок денний", url, width=1200, height=850, js_api=DesktopApi())
+            webview.start()
+        except Exception as exc:
+            import traceback
+            import webbrowser
+            traceback.print_exc()
+            webbrowser.open(url)
+            _message_box(
+                "Порядок денний",
+                "Не вдалося відкрити вікно програми (ймовірно, не встановлено Microsoft Edge WebView2 Runtime).\n\n"
+                "Програму відкрито у браузері за замовчуванням. Працюйте там, а коли закінчите — натисніть OK "
+                f"тут: програма закриється.\n\nПричина: {exc}", warning=True)
     server.shutdown()
+
+
+def main():
+    if "--selftest" in sys.argv:
+        index = sys.argv.index("--selftest")
+        sys.exit(selftest(sys.argv[index + 1] if index + 1 < len(sys.argv) else "selftest.txt"))
+    _setup_logging()
+    try:
+        _run()
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        _message_box("Порядок денний — помилка запуску",
+                     f"Програма не змогла запуститися:\n{exc}\n\nПовний опис записано в файл:\n{LOG_PATH}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

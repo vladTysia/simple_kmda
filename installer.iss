@@ -13,6 +13,7 @@ OutputBaseFilename=PlenaryAgenda-Setup
 Compression=lzma2
 SolidCompression=yes
 PrivilegesRequired=lowest
+ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\{#AppExe}
 

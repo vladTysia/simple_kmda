@@ -312,7 +312,8 @@ def audit_agenda(pdf_path: Path):
     (вид, розділ, номер пункту або None, повідомлення, extra), впорядкований за
     розташуванням у документі. extra — дані для виправлення (або None): у
     "немає посилання" {"pos": [сторінка, y]} пункту, в "однакове посилання"
-    {"items": [{"num", "section", "pos"}, ...]} — див. set_item_link. Нічого не завантажує.
+    {"items": [{"num", "section", "pos", "pr"}, ...]} — див. set_item_link; у кожному
+    extra також "pr" — ПР пункту ("ПР 2682/ПР від 29.10.2020"). Нічого не завантажує.
 
     Види зауважень:
       "немає посилання"      — у пункті "N) Про ..." немає гіперпосилання;
@@ -350,6 +351,7 @@ def audit_agenda(pdf_path: Path):
                 rect = fitz.Rect(link["from"])
                 if uri and PROJECT_URL_RE.search(uri) and not rect.is_empty:
                     links.append((page_index, rect.y0, uri))
+        citations = _item_citations(doc, _document_layout(doc))
     finally:
         doc.close()
 
@@ -378,8 +380,17 @@ def audit_agenda(pdf_path: Path):
 
     problems = []  # (порядок, вид, розділ, пункт, текст)
 
+    def pr_label(it):
+        """"ПР 2682/ПР від 29.10.2020" — файл ПР (проєкт рішення) цього пункту."""
+        c = citations.get((it["page"], it["y"]))
+        return f"ПР {c}" if c else "ПР не розпізнано"
+
     def add(order_item, kind, section_label, num, text, extra=None):
-        problems.append(((order_item["page"], order_item["y"]) if order_item else (0, 0), kind, section_label, num, text, extra))
+        extra = dict(extra or {})
+        if order_item is not None:
+            extra["pr"] = pr_label(order_item)
+        problems.append(((order_item["page"], order_item["y"]) if order_item else (0, 0), kind, section_label, num, text,
+                         extra or None))
 
     def item_label(it):
         return f"«{it['snippet']}»" if it["snippet"] else ""
@@ -424,7 +435,7 @@ def audit_agenda(pdf_path: Path):
     for uri, owners in uri_items.items():
         if len(owners) < 2:
             continue
-        nums = ", ".join(str(o["num"]) for o in owners)
+        nums = ", ".join(f"{o['num']} ({pr_label(o)})" for o in owners)
         sections = sorted({o["section"] for o in owners})
         consecutive = len(sections) == 1 and all(
             b["num"] == a["num"] + 1 for a, b in zip(owners, owners[1:])
@@ -433,7 +444,8 @@ def audit_agenda(pdf_path: Path):
                 if consecutive else "проєкт буде скачано окремо для кожного з них")
         add(owners[0], "однакове посилання", owners[0]["section"], owners[0]["num"],
             f"те саме посилання у пунктах {nums} (розділ {', '.join(sections)}): {note}. {uri}",
-            {"items": [{"num": o["num"], "section": o["section"], "pos": [o["page"], o["y"]]} for o in owners]})
+            {"items": [{"num": o["num"], "section": o["section"], "pos": [o["page"], o["y"]], "pr": pr_label(o)}
+                       for o in owners]})
 
     for section_label, page_index, uri in orphans:
         problems.append(((page_index, 0), "посилання без пункту", section_label, None,
@@ -459,6 +471,39 @@ def _document_layout(doc):
         items.append({"section": section, "num": payload, "page": p, "y": y,
                       "end": (nxt[0], nxt[1]) if nxt else (len(doc), 0.0)})
     return items
+
+
+def _item_citations(doc, layout) -> dict:
+    """{(сторінка, y): "2682/ПР від 29.10.2020"} — номер і дата рішення (ПР) з тексту
+    кожного пункту. Власна цитата пункту — остання в його тексті. Нерозпізнані
+    пункти в словнику відсутні."""
+    by_page = {}
+    for pno in range(len(doc)):
+        rows = []
+        for block in doc[pno].get_text("dict")["blocks"]:
+            if block.get("type") != 0:
+                continue
+            for line in block["lines"]:
+                text = "".join(sp["text"] for sp in line["spans"]).strip()
+                if text:
+                    rows.append((line["bbox"][1], line["bbox"][0], text))
+        by_page[pno] = rows
+
+    result = {}
+    for item in layout:
+        start, end = (item["page"], item["y"]), item["end"]
+        picked = []
+        for pno in range(item["page"], min(end[0], len(doc) - 1) + 1):
+            # рядок групуємо за y з допуском (окремі слова одного рядка мають трохи різні y0)
+            picked += [(pno, round(y / 8), x, t) for y, x, t in by_page[pno] if start <= (pno, y) < end]
+        picked.sort()
+        matches = list(CITATION_RE.finditer(" ".join(t[3] for t in picked)))
+        if matches:
+            m = matches[-1]
+            number = re.sub(r"\s+", "", m.group(2))
+            number = re.sub(r"(?<!/)ПР$", "/ПР", number, flags=re.IGNORECASE)
+            result[(item["page"], item["y"])] = f"{number.rsplit('-', 1)[-1]} від {m.group(1)}"
+    return result
 
 
 def _item_links(doc, item, cache=None):
@@ -500,7 +545,9 @@ def fix_link_misalignment(pdf_path: Path, log=print) -> int:
     doc = fitz.open(pdf_path)
     try:
         cache, fixed = {}, 0
-        for item in _document_layout(doc):
+        layout = _document_layout(doc)
+        citations = _item_citations(doc, layout)
+        for item in layout:
             links = [(p, l) for p, l in _item_links(doc, item, cache)
                      if l.get("kind") == fitz.LINK_URI and PROJECT_URL_RE.search(l.get("uri", ""))]
             if not links:
@@ -516,7 +563,9 @@ def fix_link_misalignment(pdf_path: Path, log=print) -> int:
                 r = fitz.Rect(link["from"])
                 doc[pno].update_link({**link, "from": fitz.Rect(r.x0, r.y0 + shift, r.x1, r.y1 + shift)})
             fixed += 1
-            log(f"[~] Виправлено автоматично: розділ {item['section']}, пункт {item['num']} — "
+            pr = citations.get((item["page"], item["y"]))
+            log(f"[~] Виправлено автоматично: розділ {item['section']}, пункт {item['num']}"
+                f"{' · ПР ' + pr if pr else ''} — "
                 f"посилання було зсунуте на {dy:+.1f} pt (стор. {item['page'] + 1}), вирівняно за номером пункту.")
         if fixed:
             _save_in_place(doc, pdf_path)
@@ -589,8 +638,9 @@ def log_audit(problems, log=print):
         log("Перевірка порядку денного: помилок не знайдено.")
         return 0
     log(f"Перевірка порядку денного: знайдено {len(problems)} зауважень (варто перевірити вручну в PDF):")
-    for kind, sec, num, text, _ in problems:
-        where = f"розділ {sec}" + (f", пункт {num}" if num is not None else "")
+    for kind, sec, num, text, extra in problems:
+        where = f"розділ {sec}" + (f", пункт {num}" if num is not None else "") + (
+            f" · {extra['pr']}" if extra and extra.get("pr") else "")
         log(f"  - [{kind}] {where}: {text}")
     return len(problems)
 
