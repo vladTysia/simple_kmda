@@ -4586,9 +4586,99 @@ class DesktopApi:
         return chosen[0] if chosen else None
 
 
-def main():
-    """Запускає Flask на вільному порту і показує інтерфейс у власному вікні
-    (pywebview). Якщо pywebview недоступний — відкриває браузер."""
+LOG_PATH = BASE_DIR / "app.log"
+
+
+def _setup_logging():
+    """У зібраному застосунку без консолі sys.stdout/stderr порожні, і помилки зникають безслідно —
+    тоді пишемо їх у app.log (у папці даних програми)."""
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    try:
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > 2 * 1024 * 1024:
+            LOG_PATH.unlink()
+        stream = open(LOG_PATH, "a", encoding="utf-8", buffering=1)
+    except OSError:
+        return
+    stream.write(f"\n=== {datetime.now():%Y-%m-%d %H:%M:%S} запуск ===\n")
+    if sys.stdout is None:
+        sys.stdout = stream
+    if sys.stderr is None:
+        sys.stderr = stream
+
+
+def _message_box(title: str, text: str, warning: bool = False):
+    """Вікно з повідомленням (Windows). Блокує, поки користувач не натисне OK."""
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(0, text, title, 0x30 if warning else 0x10)
+    except Exception:
+        pass
+
+
+def selftest(report_path: str) -> int:
+    """Перевірка зібраного застосунку без вікна: чи на місці бібліотеки та Tesseract і чи відповідає
+    сервер. Результат — у файл (без консолі іншого виводу немає); код виходу 0 — усе гаразд."""
+    lines = [f"Python {sys.version.split()[0]} {platform.architecture()[0]}, {platform.platform()}, зібрано: {FROZEN}"]
+    failed = []
+
+    def check(name, fn):
+        try:
+            lines.append(f"OK    {name}: {fn()}")
+        except Exception as exc:
+            failed.append(name)
+            lines.append(f"ЗБІЙ  {name}: {type(exc).__name__}: {exc}")
+
+    def tesseract():
+        cmd = find_tesseract_cmd()
+        if not cmd:
+            raise RuntimeError("не знайдено")
+        out = subprocess.run([cmd, "--list-langs"], capture_output=True, text=True, timeout=30,
+                             env=_tesseract_env(cmd), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if "ukr" not in out.stdout:
+            raise RuntimeError("немає мовних даних ukr: " + out.stdout.replace("\n", " ")[:80])
+        return cmd
+
+    def webview_ok():
+        import webview
+        if platform.system() == "Windows":
+            from webview.platforms import edgechromium  # noqa: F401  (потребує pythonnet / WebView2Loader)
+        return "імпортується"
+
+    def server():
+        client = app.test_client()
+        page = client.get("/")
+        if page.status_code != 200 or b"<title>" not in page.data:
+            raise RuntimeError(f"головна сторінка: HTTP {page.status_code}")
+        for url in ("/api/sections", "/api/tree", "/api/contacts", "/api/mail/settings"):
+            if client.get(url).status_code != 200:
+                raise RuntimeError(f"{url} відповів не 200")
+        return "сторінка й API відповідають"
+
+    def data_dir():
+        probe = BASE_DIR / ".selftest"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return str(BASE_DIR)
+
+    check("PyMuPDF", lambda: fitz.__doc__.split("\n")[0])
+    check("python-docx, openpyxl", lambda: (__import__("openpyxl").__version__, Document.__module__)[0])
+    check("pywebview", webview_ok)
+    check("Outlook (pywin32)", lambda: ("доступний" if outlook_available() else "недоступний") if platform.system() == "Windows" else "не Windows")
+    check("кошик (send2trash)", lambda: __import__("send2trash") and "імпортується")
+    check("Tesseract + ukr", tesseract)
+    check("сервер", server)
+    check("папка даних", data_dir)
+    lines.append("РЕЗУЛЬТАТ: " + ("усе гаразд" if not failed else "є збої: " + ", ".join(failed)))
+    Path(report_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return 1 if failed else 0
+
+
+def _run():
+    """Запускає Flask на вільному порту і показує інтерфейс у власному вікні (pywebview).
+    Якщо pywebview недоступний або вікно не відкрилося — відкриває браузер."""
     from werkzeug.serving import make_server
 
     server = make_server("127.0.0.1", 0, app, threaded=True)
@@ -4602,9 +4692,35 @@ def main():
         print(f"Відкрито в браузері: {url}  (Ctrl+C — вихід)")
         threading.Event().wait()
     else:
-        webview.create_window("Порядок денний", url, width=1200, height=850, js_api=DesktopApi())
-        webview.start()
+        try:
+            webview.create_window("Порядок денний", url, width=1200, height=850, js_api=DesktopApi())
+            webview.start()
+        except Exception as exc:
+            import traceback
+            import webbrowser
+            traceback.print_exc()
+            webbrowser.open(url)
+            _message_box(
+                "Порядок денний",
+                "Не вдалося відкрити вікно програми (ймовірно, не встановлено Microsoft Edge WebView2 Runtime).\n\n"
+                "Програму відкрито у браузері за замовчуванням. Працюйте там, а коли закінчите — натисніть OK "
+                f"тут: програма закриється.\n\nПричина: {exc}", warning=True)
     server.shutdown()
+
+
+def main():
+    if "--selftest" in sys.argv:
+        index = sys.argv.index("--selftest")
+        sys.exit(selftest(sys.argv[index + 1] if index + 1 < len(sys.argv) else "selftest.txt"))
+    _setup_logging()
+    try:
+        _run()
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        _message_box("Порядок денний — помилка запуску",
+                     f"Програма не змогла запуститися:\n{exc}\n\nПовний опис записано в файл:\n{LOG_PATH}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

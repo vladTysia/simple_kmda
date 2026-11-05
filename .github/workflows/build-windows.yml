@@ -40,6 +40,13 @@ jobs:
           --add-data "build_tesseract;tesseract"
           gui_app.py
 
+      - name: Self-test the built app
+        shell: pwsh
+        run: |
+          $p = Start-Process "dist\PlenaryAgenda\PlenaryAgenda.exe" -ArgumentList "--selftest","selftest-build.txt" -Wait -PassThru
+          if (Test-Path selftest-build.txt) { Get-Content selftest-build.txt }
+          if ($p.ExitCode -ne 0) { Write-Error "Built app self-test failed"; exit 1 }
+
       - name: Build installer (Inno Setup)
         shell: pwsh
         run: |
@@ -50,3 +57,26 @@ jobs:
         with:
           name: PlenaryAgenda-Setup
           path: installer/PlenaryAgenda-Setup.exe
+
+      - name: Install the installer on a clean Windows and self-test the installed app
+        shell: pwsh
+        run: |
+          $p = Start-Process "installer\PlenaryAgenda-Setup.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/LOG=$PWD\install.log" -Wait -PassThru
+          Write-Host "Installer exit code: $($p.ExitCode)"
+          $exe = Get-ChildItem "$env:LOCALAPPDATA\Programs" -Recurse -Filter PlenaryAgenda.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { if (Test-Path install.log) { Get-Content install.log -Tail 40 }; Write-Error "PlenaryAgenda.exe not found after install"; exit 1 }
+          Write-Host "Installed: $($exe.FullName)"
+          $t = Start-Process $exe.FullName -ArgumentList "--selftest","selftest-installed.txt" -Wait -PassThru
+          if (Test-Path selftest-installed.txt) { Get-Content selftest-installed.txt }
+          if ($t.ExitCode -ne 0) { Write-Error "Installed app self-test failed"; exit 1 }
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics
+          path: |
+            selftest-*.txt
+            install.log
+            build/PlenaryAgenda/warn-PlenaryAgenda.txt
+          if-no-files-found: ignore
